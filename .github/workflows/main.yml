@@ -100,11 +100,11 @@ jobs:
       - name: 📥 Initialize Model Repository
         run: |
           echo "──────────────────────────────────────────"
-          echo " 📥  All models configured as on-demand."
+          echo " 📥  All models initialized for on-demand downloading."
           echo "──────────────────────────────────────────"
           ollama list
 
-      - name: 🔧 Write the web server (Glassmorphism UI with Live Model Puller)
+      - name: 🔧 Write the web server (Glassmorphism UI with Fixed Live Puller)
         run: |
           cat > ollama_server.py << 'PYEOF'
           #!/usr/bin/env python3
@@ -129,13 +129,10 @@ jobs:
 
           app = FastAPI(title="Local LLM UI (Optimized)")
 
-          # Unified Model Catalog with On-Demand Download Support
           CATALOG_MODELS = [
-              # Added Custom Image / Turbo Models
+              # Requested Image / Vision / Custom Models
               "x/z-image-turbo:latest",
               "x/flux2-klein:latest",
-
-              # Requested Models
               "deepseek-ocr:latest",
               "it:deepseek-ocr:latest",
               "flux2-klein:4b",
@@ -170,12 +167,12 @@ jobs:
               "llama3.2:3b",
               "tinyllama",
 
-              # Gemma & Phi Families
+              # Gemma & Phi
               "gemma2:2b",
               "phi3.5",
               "phi3:mini",
 
-              # Mistral & Light Alternates
+              # Mistral & Other Lightweight Models
               "mistral:7b",
               "openhermes",
               "dolphin-mistral",
@@ -270,7 +267,7 @@ jobs:
                                   if line:
                                       yield f"data: {line}\n\n"
                   except Exception as exc:
-                      logger.exception("pull stream failed")
+                      logger.exception("pull stream error")
                       yield f"data: {json.dumps({'error': str(exc)})}\n\n"
                   yield "data: [DONE]\n\n"
               return StreamingResponse(generate(), media_type="text/event-stream")
@@ -387,7 +384,6 @@ jobs:
             .settings-group label { display: flex; justify-content: space-between; align-items: center; }
             .settings-group input[type="range"] { width: 100%; accent-color: var(--cyan); margin-top: 4px; }
             
-            /* Model List */
             .model-section-title { font-weight: 600; color: var(--text); margin-bottom: 6px; display: flex; justify-content: space-between; align-items: center; }
             .model-list {
               background: rgba(0,0,0,0.25); border: 1px solid var(--border); border-radius: 10px;
@@ -411,7 +407,6 @@ jobs:
             .dl-btn:hover { background: var(--accent); color: #fff; }
             .dl-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
-            /* System Stats UI */
             .system-stats {
               background: rgba(0,0,0,0.3); border: 1px solid var(--border);
               border-radius: 12px; padding: 12px; margin-top: 8px;
@@ -498,27 +493,27 @@ jobs:
             .stop-btn:hover { background: #dc2626; }
             .send-btn:disabled { opacity: 0.5; cursor: not-allowed; }
             
-            /* Download Progress Modal */
+            /* Modal Overlay */
             .modal-overlay {
-              position: fixed; inset: 0; background: rgba(0,0,0,0.75); backdrop-filter: blur(8px);
+              position: fixed; inset: 0; background: rgba(0,0,0,0.8); backdrop-filter: blur(8px);
               display: none; align-items: center; justify-content: center; z-index: 100;
             }
             .modal-box {
               background: #18181b; border: 1px solid var(--border); border-radius: 16px;
-              width: 90%; max-width: 500px; padding: 24px; display: flex; flex-direction: column; gap: 16px;
+              width: 90%; max-width: 520px; padding: 24px; display: flex; flex-direction: column; gap: 16px;
               box-shadow: 0 20px 40px rgba(0,0,0,0.6);
             }
             .modal-title { font-size: 16px; font-weight: 600; color: var(--text); }
             .modal-log {
               background: #09090b; border: 1px solid var(--border); border-radius: 8px;
               padding: 12px; font-family: monospace; font-size: 12px; color: #a1a1aa;
-              height: 120px; overflow-y: auto; white-space: pre-wrap;
+              height: 140px; overflow-y: auto; white-space: pre-wrap; line-height: 1.5;
             }
             .dl-modal-bar { width: 100%; height: 8px; background: rgba(255,255,255,0.1); border-radius: 4px; overflow: hidden; }
             .dl-modal-fill { height: 100%; background: var(--cyan); width: 0%; transition: width 0.2s ease; }
             .modal-close-btn {
               align-self: flex-end; background: var(--border); border: none; color: var(--text);
-              padding: 8px 16px; border-radius: 8px; cursor: pointer; font-size: 13px;
+              padding: 8px 18px; border-radius: 8px; cursor: pointer; font-size: 13px; font-weight: 500;
             }
             .modal-close-btn:hover { background: rgba(255,255,255,0.2); }
           </style>
@@ -726,8 +721,8 @@ jobs:
               loadModels();
             }
 
-            function appendLog(msg) {
-              modalLogs.textContent += msg + '\n';
+            function appendLog(msg, isError = false) {
+              modalLogs.textContent += (isError ? '❌ ' : '') + msg + '\n';
               modalLogs.scrollTop = modalLogs.scrollHeight;
             }
 
@@ -741,11 +736,14 @@ jobs:
               downloadModal.style.display = 'flex';
               modalTitle.textContent = `📥 Pulling ${modelName}`;
               modalBar.style.width = '0%';
+              modalBar.style.background = 'var(--cyan)';
               modalPercent.textContent = '0%';
-              modalStatus.textContent = 'Initiating download stream...';
+              modalStatus.textContent = 'Initiating download...';
               modalLogs.textContent = `[Info] Requesting pull for: ${modelName}\n`;
               modalCloseBtn.disabled = true;
               modalCloseBtn.textContent = 'Downloading...';
+
+              let streamFailed = false;
 
               try {
                 const resp = await fetch('/api/pull', {
@@ -755,14 +753,14 @@ jobs:
                 });
 
                 if (!resp.ok) {
-                  throw new Error(`Server returned status ${resp.status}`);
+                  throw new Error(`Server returned HTTP ${resp.status}`);
                 }
 
                 const reader = resp.body.getReader();
                 const decoder = new TextDecoder();
                 let buffer = '';
 
-                while (true) {
+                pullLoop: while (true) {
                   const { done, value } = await reader.read();
                   if (done) break;
                   
@@ -778,39 +776,52 @@ jobs:
                     if (jsonStr.startsWith('data: ')) {
                       jsonStr = jsonStr.slice(6);
                     }
-                    if (jsonStr === '[DONE]') continue;
+                    if (jsonStr === '[DONE]') break pullLoop;
 
+                    let data = null;
                     try {
-                      const data = JSON.parse(jsonStr);
-                      if (data.error) {
-                        appendLog(`[Error] ${data.error}`);
-                        modalStatus.textContent = 'Download failed.';
-                        throw new Error(data.error);
-                      }
-                      
-                      if (data.status) {
-                        modalStatus.textContent = data.status;
-                        if (data.completed && data.total) {
-                          const pct = Math.round((data.completed / data.total) * 100);
-                          modalBar.style.width = pct + '%';
-                          modalPercent.textContent = pct + '%';
-                          const doneMB = (data.completed / (1024 * 1024)).toFixed(1);
-                          const totalMB = (data.total / (1024 * 1024)).toFixed(1);
-                          modalStatus.textContent = `${data.status} (${doneMB}MB / ${totalMB}MB)`;
-                        } else {
-                          appendLog(`[Status] ${data.status}`);
-                        }
-                      }
+                      data = JSON.parse(jsonStr);
                     } catch (e) {
-                      // Non-JSON or chunk parsing artifact
+                      continue;
+                    }
+
+                    if (data.error) {
+                      streamFailed = true;
+                      appendLog(`[Error] ${data.error}`, true);
+                      modalStatus.textContent = 'Failed: ' + data.error;
+                      modalBar.style.background = 'var(--danger)';
+                      break pullLoop;
+                    }
+                    
+                    if (data.status) {
+                      modalStatus.textContent = data.status;
+                      if (data.completed && data.total) {
+                        const pct = Math.round((data.completed / data.total) * 100);
+                        modalBar.style.width = pct + '%';
+                        modalPercent.textContent = pct + '%';
+                        const doneMB = (data.completed / (1024 * 1024)).toFixed(1);
+                        const totalMB = (data.total / (1024 * 1024)).toFixed(1);
+                        modalStatus.textContent = `${data.status} (${doneMB}MB / ${totalMB}MB)`;
+                      } else {
+                        appendLog(`[Status] ${data.status}`);
+                      }
                     }
                   }
                 }
 
+                if (streamFailed) {
+                  modalCloseBtn.disabled = false;
+                  modalCloseBtn.textContent = 'Close';
+                  modalCloseBtn.onclick = closeModal;
+                  loadModels();
+                  return;
+                }
+
                 modalBar.style.width = '100%';
+                modalBar.style.background = 'var(--ok)';
                 modalPercent.textContent = '100%';
                 modalStatus.textContent = 'Completed successfully!';
-                appendLog(`[Success] Model ${modelName} downloaded and verified.`);
+                appendLog(`[Success] Model ${modelName} ready.`);
                 modalCloseBtn.disabled = false;
                 modalCloseBtn.textContent = 'Done & Select';
                 modalCloseBtn.onclick = () => {
@@ -820,8 +831,9 @@ jobs:
                 loadModels();
 
               } catch (err) {
-                appendLog(`[Failed] ${err.message || 'Unknown network error'}`);
-                modalStatus.textContent = 'Download stopped with errors.';
+                modalBar.style.background = 'var(--danger)';
+                appendLog(`[Failed] ${err.message || 'Network error'}`, true);
+                modalStatus.textContent = 'Download error.';
                 modalCloseBtn.disabled = false;
                 modalCloseBtn.textContent = 'Close';
                 modalCloseBtn.onclick = closeModal;
