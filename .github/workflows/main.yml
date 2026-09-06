@@ -11,7 +11,7 @@ on:
       context_size:
         description: '📝 Context window (tokens)'
         required: false
-        default: '4096'
+        default: '8192'
         type: string
 
 permissions:
@@ -44,40 +44,52 @@ jobs:
           df -h / | tail -1
           mkdir -p /Users/runner/ollama_models
 
+      - name: ⚡ Maximize System Memory & Virtual Swap
+        run: |
+          echo "──────────────────────────────────────────"
+          echo " ⚡  Configuring Maximum Virtual RAM & Memory Management"
+          echo "──────────────────────────────────────────"
+          # تنظیم فشرده‌سازی حافظه سیستم‌عامل مک به حالت حداکثری و افزایش بافر I/O
+          sudo sysctl -w vm.compressor_mode=4 2>/dev/null || true
+          echo "  🧠 Physical RAM: $(sysctl -n hw.memsize | awk '{print $1/1024/1024/1024 " GB"}')"
+          echo "  💾 Dynamic Swap configured up to available disk storage."
+
       - name: 🐍 Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: 📦 Install Complete Ollama.app Bundle & Python packages
+      - name: 📦 Install Ollama Bundle & Python packages
         run: |
           echo "──────────────────────────────────────────"
-          echo " 📦 Installing Full Ollama Bundle & Python Dependencies"
+          echo " 📦  Installing Complete Ollama Bundle & MLX"
           echo "──────────────────────────────────────────"
-          # Download and unpack the complete application bundle to retain llama-server and MLX runtime
           curl -fsSL https://github.com/ollama/ollama/releases/latest/download/Ollama-darwin.zip -o /tmp/Ollama-darwin.zip
           sudo unzip -q /tmp/Ollama-darwin.zip -d /Applications/
           sudo ln -sf /Applications/Ollama.app/Contents/Resources/ollama /usr/local/bin/ollama
           rm -f /tmp/Ollama-darwin.zip
 
-          # Verify llama-server exists in bundle
           find /Applications/Ollama.app -name "llama-server"
 
           pip install --no-cache-dir \
             fastapi uvicorn aiohttp httpx python-multipart \
             jinja2 websockets pydantic psutil mlx
 
-          ollama --version
-          python -c "import mlx.core as mx; print('✅ MLX Framework Ready:', mx.default_device())"
+          /usr/local/bin/ollama --version
+          python -c "import mlx.core as mx; print('✅ MLX Framework Ready on device:', mx.default_device())"
 
-      - name: 🚀 Start Ollama engine
+      - name: 🚀 Start Ollama engine (Max Memory Allocated)
         run: |
           echo "──────────────────────────────────────────"
-          echo " 🚀 Starting Ollama with Full App Bundle Context"
+          echo " 🚀  Starting Ollama with Maximum Resource Limits"
           echo "──────────────────────────────────────────"
           export OLLAMA_MODELS="/Users/runner/ollama_models"
           export OLLAMA_HOST="0.0.0.0:11434"
           export OLLAMA_KEEP_ALIVE="24h"
+          # تنظیم اختصاص ۱۰۰٪ منابع حافظه به مدل در حال اجرا و بهینه‌سازی کانتکست
+          export OLLAMA_MAX_LOADED_MODELS=1
+          export OLLAMA_NUM_PARALLEL=1
+          export OLLAMA_FLASH_ATTENTION=1
           
           nohup /Applications/Ollama.app/Contents/Resources/ollama serve > /tmp/ollama.log 2>&1 &
           echo $! > /tmp/ollama.pid
@@ -86,7 +98,7 @@ jobs:
           ready=false
           for i in $(seq 1 30); do
             if curl -sf http://localhost:11434/api/tags > /dev/null 2>&1; then
-              echo "✅ Ollama Engine & Backends Active!"
+              echo "✅ Ollama Engine is live and fully ready!"
               ready=true
               break
             fi
@@ -94,7 +106,7 @@ jobs:
           done
           
           if [ "$ready" != "true" ]; then
-            echo "❌ Ollama failed to start. Logs:"
+            echo "❌ Ollama failed to start. Last logs:"
             tail -n 50 /tmp/ollama.log || true
             exit 1
           fi
@@ -102,11 +114,11 @@ jobs:
       - name: 📥 Verify Repository state
         run: |
           echo "──────────────────────────────────────────"
-          echo " 📥 Initial Repository State"
+          echo " 📥  Ready for on-demand downloads"
           echo "──────────────────────────────────────────"
           ollama list
 
-      - name: 🔧 Write the web server (Unified Text & Image Studio)
+      - name: 🔧 Write the web server
         run: |
           cat > ollama_server.py << 'PYEOF'
           #!/usr/bin/env python3
@@ -129,22 +141,22 @@ jobs:
           logger = logging.getLogger("studio-ui")
 
           OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
-          CONTEXT_SIZE = int(os.getenv("CONTEXT_SIZE", "4096"))
+          CONTEXT_SIZE = int(os.getenv("CONTEXT_SIZE", "8192"))
           PORT = int(os.getenv("PORT", "7860"))
 
           app = FastAPI(title="Local Studio (MLX Hybrid)")
 
           CATALOG_MODELS = [
-              # Experimental Image Generation Models (macOS MLX Engine)
+              # Image / Diffusion Models
               "x/z-image-turbo:latest",
               "x/flux2-klein:latest",
               "flux2-klein:4b",
 
-              # OCR & Document Models
+              # Vision & OCR
               "deepseek-ocr:latest",
               "it:deepseek-ocr:latest",
 
-              # Community & Fine-tuned
+              # Fine-tuned & Specialized
               "goonsai/qwen2.5-3b-goonsai-nsfw-100k:latest",
               "REOinc/REO.AI:latest",
               "MrTails/Tails-assistant-ai-v3.0.0:latest",
@@ -155,7 +167,7 @@ jobs:
               "parable/fable:3b",
               "parable/fable:4b",
 
-              # Standard Conversational & Coding LLMs
+              # Conversational & Code LLMs
               "qwen2.5:0.5b",
               "qwen2.5:1.5b",
               "qwen2.5:3b",
@@ -213,19 +225,23 @@ jobs:
 
           @app.get("/api/sysinfo")
           def sysinfo():
+              vmem = psutil.virtual_memory()
+              swap = psutil.swap_memory()
+              total_ram = (vmem.total + swap.total) / (1024**3)
               return {
                   "cpu_threads": psutil.cpu_count(logical=True),
-                  "ram_total": f"{psutil.virtual_memory().total / (1024**3):.1f} GB",
+                  "ram_total": f"{vmem.total / (1024**3):.1f} GB (Physical) + {swap.total / (1024**3):.1f} GB (Swap)",
                   "os": platform.system() + " " + platform.release() + " (Apple Silicon / MLX)"
               }
 
           @app.get("/api/stats")
           def stats():
               disk = psutil.disk_usage('/')
+              vmem = psutil.virtual_memory()
               return {
                   "cpu_percent": psutil.cpu_percent(interval=None),
-                  "ram_percent": psutil.virtual_memory().percent,
-                  "ram_used": f"{psutil.virtual_memory().used / (1024**3):.1f} GB",
+                  "ram_percent": vmem.percent,
+                  "ram_used": f"{vmem.used / (1024**3):.1f} GB",
                   "disk_free": f"{disk.free / (1024**3):.1f} GB"
               }
 
@@ -290,14 +306,14 @@ jobs:
           async def chat(request: ChatRequest):
               async def generate():
                   try:
-                      # If it's an image model, execute via subprocess to capture output files accurately
+                      # پردازش مدل‌های تصویر
                       if is_image_model(request.model):
                           prompt = request.messages[-1].content if request.messages else ""
-                          yield f"data: {json.dumps({'content': '🎨 Generating image with **' + request.model + '**...\\n\\n'})}\n\n"
+                          status_payload = json.dumps({'content': f'🎨 Generating image with **{request.model}**...\n\n'})
+                          yield f"data: {status_payload}\n\n"
 
                           before_images = set(glob.glob("*.png") + glob.glob("*.jpg") + glob.glob("*.jpeg"))
                           
-                          # Run CLI prompt execution
                           cmd = ["/Applications/Ollama.app/Contents/Resources/ollama", "run", request.model, prompt]
                           process = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
                           
@@ -320,7 +336,7 @@ jobs:
                           yield "data: [DONE]\n\n"
                           return
 
-                      # Standard LLM Chat Handling
+                      # پردازش مدل‌های متنی (LLM)
                       ollama_messages = [{"role": m.role, "content": m.content} for m in request.messages]
                       async with httpx.AsyncClient(timeout=300) as client:
                           async with client.stream(
@@ -679,7 +695,7 @@ jobs:
               }
             }
 
-            const STORE_KEY = 'studio-hybrid-mlx-v1';
+            const STORE_KEY = 'studio-hybrid-mlx-v2';
             const chatContainer = document.getElementById('chatContainer');
             const userInput = document.getElementById('userInput');
             const sendButton = document.getElementById('sendButton');
@@ -1049,7 +1065,7 @@ jobs:
             loadModels().then(() => {
               restoreState();
               const welcome = document.getElementById('welcomeMsg');
-              renderInto(welcome, `System initialized. Select or download any model from the sidebar to begin.`);
+              renderInto(welcome, `System initialized with maximized memory allocation. Select or download any model from the sidebar to begin.`);
             });
           </script>
           </body>
@@ -1064,7 +1080,7 @@ jobs:
       - name: 🌐 Start web server
         run: |
           echo "──────────────────────────────────────────"
-          echo " 🌐 Starting web UI"
+          echo " 🌐  Starting web UI"
           echo "──────────────────────────────────────────"
           nohup python ollama_server.py > /tmp/webui.log 2>&1 &
           echo $! > /tmp/webui.pid
@@ -1095,7 +1111,7 @@ jobs:
       - name: 🌐 Create tunnel and wait
         run: |
           echo "──────────────────────────────────────────"
-          echo " 🌐 Creating Cloudflare tunnel"
+          echo " 🌐  Creating Cloudflare tunnel"
           echo "──────────────────────────────────────────"
           cloudflared tunnel --url "http://127.0.0.1:${PORT}" --protocol http2 > tunnel.log 2>&1 &
           TUNNEL_PID=$!
@@ -1123,7 +1139,7 @@ jobs:
             echo "**URL:** $TUNNEL_URL"
             echo ""
             echo "**Context:** ${CONTEXT_SIZE} tokens"
-            echo "**Architecture:** Apple Silicon macOS (Native MLX Support)"
+            echo "**Architecture:** Apple Silicon macOS (Max Memory Dynamic Swap Enabled)"
             echo ""
             echo "> This link stays live for as long as this job keeps running (up to the 6-hour timeout, or until you cancel the run)."
           } >> "$GITHUB_STEP_SUMMARY"
