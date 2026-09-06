@@ -11,7 +11,7 @@ on:
       context_size:
         description: '📝 Context window (tokens)'
         required: false
-        default: '8192'
+        default: '4096'
         type: string
 
 permissions:
@@ -44,13 +44,18 @@ jobs:
           df -h / | tail -1
           mkdir -p /Users/runner/ollama_models
 
-      - name: ⚡ Maximize System Memory & Virtual Swap
+      - name: ⚡ Maximize System Memory & Kill Background Bloat
         run: |
           echo "──────────────────────────────────────────"
-          echo " ⚡  Configuring Memory Limits"
+          echo " ⚡  Optimizing macOS Memory"
           echo "──────────────────────────────────────────"
           sudo sysctl -w vm.compressor_mode=4 2>/dev/null || true
-          echo "  🧠 Physical RAM: $(sysctl -n hw.memsize | awk '{print $1/1024/1024/1024 " GB"}')"
+          # کشتن پروسه‌های سنگین پس‌زمینه مکینتاش که نیازی به آن‌ها نیست برای باز شدن رم
+          sudo pkill -f "Spotlight" 2>/dev/null || true
+          sudo pkill -f "mds" 2>/dev/null || true
+          sudo pkill -f "com.apple.coreservices.launchservicesd" 2>/dev/null || true
+          echo "  🧠 Memory ready:"
+          vm_stat | perl -ne '/page size of (\d+)/ and $size=$1; /(Pages free|Pages active|Pages inactive|Pages speculative): \s+(\d+)/ and $mem{$1}=$2*$size; END {printf "Available: %.2f GB\n", ($mem{"Pages free:"}+$mem{"Pages inactive:"}+$mem{"Pages speculative:"})/1024/1024/1024}'
 
       - name: 🐍 Setup Python
         uses: actions/setup-python@v5
@@ -60,15 +65,12 @@ jobs:
       - name: 📦 Install Official Ollama Bundle (Image Gen Enabled) & MLX
         run: |
           echo "──────────────────────────────────────────"
-          echo " 📦  Installing Ollama Release with Image Gen Enabled"
+          echo " 📦  Installing Ollama Release"
           echo "──────────────────────────────────────────"
-          # دانلود نسخه معتبر حاوی پشتیبانی کامل و آن‌لاک از مدل‌های تصویری MLX
           curl -fsSL https://github.com/ollama/ollama/releases/download/v0.32.5/Ollama-darwin.zip -o /tmp/Ollama-darwin.zip
           sudo unzip -q /tmp/Ollama-darwin.zip -d /Applications/
           sudo ln -sf /Applications/Ollama.app/Contents/Resources/ollama /usr/local/bin/ollama
           rm -f /tmp/Ollama-darwin.zip
-
-          find /Applications/Ollama.app -name "llama-server"
 
           pip install --no-cache-dir \
             fastapi uvicorn aiohttp httpx python-multipart \
@@ -77,14 +79,16 @@ jobs:
           /usr/local/bin/ollama --version
           python -c "import mlx.core as mx; print('✅ MLX Framework Ready on device:', mx.default_device())"
 
-      - name: 🚀 Start Ollama engine
+      - name: 🚀 Start Ollama engine (Zero Overhead & Auto Swap Mode)
         run: |
           echo "──────────────────────────────────────────"
-          echo " 🚀  Starting Ollama Engine"
+          echo " 🚀  Starting Ollama Engine with Bypass Flags"
           echo "──────────────────────────────────────────"
           export OLLAMA_MODELS="/Users/runner/ollama_models"
           export OLLAMA_HOST="0.0.0.0:11434"
           export OLLAMA_KEEP_ALIVE="24h"
+          # حذف سربار حافظه تا اجازه لود مدل‌های بالای ۴ گیگابایت داده شود
+          export OLLAMA_GPU_OVERHEAD=0
           export OLLAMA_MAX_LOADED_MODELS=1
           export OLLAMA_NUM_PARALLEL=1
           export OLLAMA_FLASH_ATTENTION=1
@@ -141,7 +145,7 @@ jobs:
           logger = logging.getLogger("studio-ui")
 
           OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
-          CONTEXT_SIZE = int(os.getenv("CONTEXT_SIZE", "8192"))
+          CONTEXT_SIZE = int(os.getenv("CONTEXT_SIZE", "4096"))
           PORT = int(os.getenv("PORT", "7860"))
 
           app = FastAPI(title="Local Studio (MLX Hybrid)")
@@ -199,6 +203,13 @@ jobs:
           def is_image_model(model_name: str) -> bool:
               m = model_name.lower()
               return any(p in m for p in IMAGE_MODEL_PREFIXES)
+
+          def clean_ansi(text: str) -> str:
+              ansi_escape = re.compile(r'(?:\x1B[@-_]|[\x80-\x9F])[0-?]*[ -/]*[@-~]')
+              text = ansi_escape.sub('', text)
+              text = re.sub(r'\[\?[0-9;]*[a-zA-Z]', '', text)
+              text = re.sub(r'\[[0-9;]*[a-zA-Z]', '', text)
+              return text.strip()
 
           class ChatMessage(BaseModel):
               role: str
@@ -287,30 +298,48 @@ jobs:
                   )
                   
                   pct_pattern = re.compile(r'(\d+)%')
+                  speed_pattern = re.compile(r'([0-9\.]+\s*(?:KB|MB|GB)/s)')
+                  size_pattern = re.compile(r'([0-9\.]+\s*(?:KB|MB|GB)\s*/\s*[0-9\.]+\s*(?:KB|MB|GB))')
+                  eta_pattern = re.compile(r'(\d+[m|s]\w*)')
                   
+                  buffer = ""
                   try:
                       while True:
-                          line_bytes = await proc.stdout.readline()
-                          if not line_bytes:
+                          chunk = await proc.stdout.read(128)
+                          if not chunk:
                               break
-                          line = line_bytes.decode('utf-8', errors='ignore').strip()
-                          if not line:
-                              continue
+                          buffer += chunk.decode('utf-8', errors='ignore')
                           
-                          match = pct_pattern.search(line)
-                          pct = int(match.group(1)) if match else None
-                          
-                          msg = {"status": line}
-                          if pct is not None:
-                              msg["percent"] = pct
-                          
-                          yield f"data: {json.dumps(msg)}\n\n"
+                          while '\r' in buffer or '\n' in buffer:
+                              delim = '\r' if '\r' in buffer else '\n'
+                              part, buffer = buffer.split(delim, 1)
+                              cleaned = clean_ansi(part)
+                              if not cleaned:
+                                  continue
+                              
+                              pct_match = pct_pattern.search(cleaned)
+                              pct = int(pct_match.group(1)) if pct_match else None
+                              speed_match = speed_pattern.search(cleaned)
+                              speed = speed_match.group(1) if speed_match else ""
+                              size_match = size_pattern.search(cleaned)
+                              size = size_match.group(1) if size_match else ""
+                              eta_match = eta_pattern.search(cleaned)
+                              eta = eta_match.group(1) if eta_match else ""
+                              
+                              msg = {
+                                  "raw": cleaned,
+                                  "percent": pct,
+                                  "speed": speed,
+                                  "size": size,
+                                  "eta": eta
+                              }
+                              yield f"data: {json.dumps(msg)}\n\n"
                       
                       await proc.wait()
                       if proc.returncode == 0:
                           yield f"data: {json.dumps({'status': 'Completed successfully!', 'percent': 100})}\n\n"
                       else:
-                          yield f"data: {json.dumps({'error': f'Pull exited with code {proc.returncode}'})}\n\n"
+                          yield f"data: {json.dumps({'error': f'Pull process failed with exit code {proc.returncode}'})}\n\n"
                   except Exception as e:
                       yield f"data: {json.dumps({'error': str(e)})}\n\n"
                   
@@ -336,8 +365,8 @@ jobs:
                   try:
                       if is_image_model(request.model):
                           prompt = request.messages[-1].content if request.messages else ""
-                          status_text = f"🎨 Generating image with **{request.model}**...\n\n"
-                          yield f"data: {json.dumps({'content': status_text})}\n\n"
+                          notice = f"🎨 Generating image with **{request.model}**...\n\n"
+                          yield f"data: {json.dumps({'content': notice})}\n\n"
 
                           before_images = set(glob.glob("*.png") + glob.glob("*.jpg") + glob.glob("*.jpeg"))
                           
@@ -354,9 +383,11 @@ jobs:
                               img_md = f"![Generated Image](data:image/png;base64,{b64_data})\n\n*Saved as: `{latest_img}`*"
                               yield f"data: {json.dumps({'content': img_md})}\n\n"
                           elif process.stdout:
-                              yield f"data: {json.dumps({'content': process.stdout})}\n\n"
+                              cleaned_stdout = clean_ansi(process.stdout)
+                              yield f"data: {json.dumps({'content': cleaned_stdout})}\n\n"
                           elif process.stderr:
-                              yield f"data: {json.dumps({'error': process.stderr})}\n\n"
+                              cleaned_stderr = clean_ansi(process.stderr)
+                              yield f"data: {json.dumps({'error': cleaned_stderr})}\n\n"
                           else:
                               yield f"data: {json.dumps({'content': 'Image generation finished.'})}\n\n"
 
@@ -381,7 +412,8 @@ jobs:
                           ) as response:
                               if response.status_code != 200:
                                   body = await response.aread()
-                                  yield f"data: {json.dumps({'error': body.decode(errors='ignore')})}\n\n"
+                                  err_text = clean_ansi(body.decode(errors='ignore'))
+                                  yield f"data: {json.dumps({'error': err_text})}\n\n"
                                   yield "data: [DONE]\n\n"
                                   return
                               async for line in response.aiter_lines():
@@ -393,14 +425,14 @@ jobs:
                                   except json.JSONDecodeError:
                                       continue
                                   if err := obj.get("error"):
-                                      yield f"data: {json.dumps({'error': err})}\n\n"
+                                      yield f"data: {json.dumps({'error': clean_ansi(err)})}\n\n"
                                       continue
                                   content = obj.get("message", {}).get("content")
                                   if content:
                                       yield f"data: {json.dumps({'content': content})}\n\n"
                   except Exception as exc:
                       logger.exception("execution error")
-                      yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+                      yield f"data: {json.dumps({'error': clean_ansi(str(exc))})}\n\n"
                   yield "data: [DONE]\n\n"
               return StreamingResponse(generate(), media_type="text/event-stream")
 
@@ -414,7 +446,7 @@ jobs:
           
           <link rel="preconnect" href="https://fonts.googleapis.com">
           <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-          <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Vazirmatn:wght@400;500;600&display=swap" rel="stylesheet">
+          <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Vazirmatn:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
           
           <script src="https://cdn.jsdelivr.net/npm/marked@4.3.0/marked.min.js"></script>
           <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.6/purify.min.js"></script>
@@ -427,83 +459,104 @@ jobs:
           <style>
             :root {
               --bg: #09090b;
-              --sidebar: rgba(24, 24, 27, 0.7);
+              --sidebar: rgba(18, 18, 23, 0.75);
               --border: rgba(255, 255, 255, 0.08);
+              --border-focus: rgba(6, 182, 212, 0.4);
               --text: #f4f4f5;
               --text-secondary: #a1a1aa;
+              --text-muted: #71717a;
               --accent: #10b981;
-              --accent-glow: rgba(16, 185, 129, 0.3);
+              --accent-glow: rgba(16, 185, 129, 0.25);
               --cyan: #06b6d4;
+              --cyan-glow: rgba(6, 182, 212, 0.25);
               --purple: #a855f7;
-              --user-bg: rgba(6, 182, 212, 0.05);
-              --assistant-bg: transparent;
-              --input-bg: rgba(24, 24, 27, 0.75);
-              --code-bg: rgba(0, 0, 0, 0.45);
+              --purple-glow: rgba(168, 85, 247, 0.2);
+              --user-bg: rgba(6, 182, 212, 0.04);
+              --input-bg: rgba(24, 24, 30, 0.85);
+              --code-bg: rgba(0, 0, 0, 0.5);
               --danger: #ef4444;
               --ok: #10b981;
-              --glass: blur(16px);
+              --glass: blur(20px);
             }
             * { margin: 0; padding: 0; box-sizing: border-box; }
             body {
               background: var(--bg); color: var(--text); height: 100vh; display: flex; overflow: hidden;
-              font-family: 'Inter', 'Vazirmatn', sans-serif;
-              background-image: radial-gradient(circle at 15% 50%, rgba(16, 185, 129, 0.04), transparent 25%),
-                                radial-gradient(circle at 85% 30%, rgba(6, 182, 212, 0.04), transparent 25%);
+              font-family: 'Inter', 'Vazirmatn', -apple-system, sans-serif;
+              background-image: radial-gradient(circle at 10% 20%, rgba(16, 185, 129, 0.05), transparent 30%),
+                                radial-gradient(circle at 90% 80%, rgba(6, 182, 212, 0.05), transparent 30%);
             }
             .sidebar {
-              width: 320px; background: var(--sidebar); border-right: 1px solid var(--border);
+              width: 325px; background: var(--sidebar); border-right: 1px solid var(--border);
               backdrop-filter: var(--glass); -webkit-backdrop-filter: var(--glass);
-              display: flex; flex-direction: column; padding: 20px; flex-shrink: 0; z-index: 10;
+              display: flex; flex-direction: column; padding: 22px 18px; flex-shrink: 0; z-index: 10;
               overflow-y: auto;
             }
+            .brand-header {
+              display: flex; align-items: center; gap: 10px; margin-bottom: 20px; padding: 0 4px;
+            }
+            .brand-logo {
+              width: 30px; height: 30px; border-radius: 8px;
+              background: linear-gradient(135deg, var(--cyan), var(--accent));
+              display: flex; align-items: center; justify-content: center;
+              font-weight: 700; color: #fff; font-size: 15px; box-shadow: 0 0 15px var(--cyan-glow);
+            }
+            .brand-name { font-size: 15px; font-weight: 600; letter-spacing: -0.3px; color: #fff; }
+            .brand-badge {
+              font-size: 10px; background: rgba(6, 182, 212, 0.15); color: var(--cyan);
+              border: 1px solid rgba(6, 182, 212, 0.3); border-radius: 4px; padding: 1px 5px; font-weight: 600;
+            }
             .new-chat-btn {
-              display: flex; align-items: center; justify-content: center; gap: 8px; width: 100%; padding: 12px;
+              display: flex; align-items: center; justify-content: center; gap: 8px; width: 100%; padding: 11px;
               background: var(--input-bg); border: 1px solid var(--border); border-radius: 12px; color: var(--text);
-              font-size: 14px; font-weight: 500; cursor: pointer; margin-bottom: 16px;
+              font-size: 13px; font-weight: 500; cursor: pointer; margin-bottom: 18px;
               transition: all 0.2s ease; font-family: inherit;
             }
-            .new-chat-btn:hover { border-color: var(--accent); box-shadow: 0 0 15px var(--accent-glow); }
+            .new-chat-btn:hover { border-color: var(--accent); box-shadow: 0 0 15px var(--accent-glow); color: #fff; }
             
-            .settings-group { display: flex; flex-direction: column; gap: 12px; font-size: 13px; color: var(--text-secondary); }
-            .settings-group label { display: flex; justify-content: space-between; align-items: center; }
-            .settings-group input[type="range"] { width: 100%; accent-color: var(--cyan); margin-top: 4px; }
+            .settings-group { display: flex; flex-direction: column; gap: 14px; font-size: 13px; color: var(--text-secondary); }
+            .settings-group label { display: flex; justify-content: space-between; align-items: center; font-size: 12px; font-weight: 500; }
+            .settings-group input[type="range"] { width: 100%; accent-color: var(--cyan); margin-top: 5px; }
             
-            .model-section-title { font-weight: 600; color: var(--text); margin-bottom: 6px; display: flex; justify-content: space-between; align-items: center; }
+            .model-section-title {
+              font-weight: 600; color: var(--text); font-size: 12px; text-transform: uppercase;
+              letter-spacing: 0.5px; display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;
+            }
             .model-list {
-              background: rgba(0,0,0,0.25); border: 1px solid var(--border); border-radius: 10px;
-              max-height: 250px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; padding: 6px; margin-bottom: 12px;
+              background: rgba(0,0,0,0.3); border: 1px solid var(--border); border-radius: 12px;
+              max-height: 250px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; padding: 6px;
             }
             .model-item {
               display: flex; align-items: center; justify-content: space-between; padding: 8px 10px;
-              border-radius: 8px; font-size: 12px; cursor: pointer; transition: background 0.2s; border: 1px solid transparent;
+              border-radius: 8px; font-size: 12px; cursor: pointer; transition: all 0.2s; border: 1px solid transparent;
             }
-            .model-item:hover { background: rgba(255,255,255,0.05); }
-            .model-item.active { background: rgba(6, 182, 212, 0.12); border-color: rgba(6, 182, 212, 0.4); }
-            .model-meta { display: flex; flex-direction: column; gap: 2px; overflow: hidden; }
+            .model-item:hover { background: rgba(255,255,255,0.04); }
+            .model-item.active { background: rgba(6, 182, 212, 0.12); border-color: rgba(6, 182, 212, 0.35); }
+            .model-meta { display: flex; flex-direction: column; gap: 3px; overflow: hidden; }
             .model-name { font-weight: 500; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 155px; }
-            .model-type-badge { font-size: 9px; padding: 2px 4px; border-radius: 4px; width: fit-content; text-transform: uppercase; }
-            .model-type-badge.image { background: rgba(168, 85, 247, 0.2); color: var(--purple); }
-            .model-type-badge.text { background: rgba(6, 182, 212, 0.2); color: var(--cyan); }
-            .model-status { font-size: 11px; }
+            .model-badges { display: flex; align-items: center; gap: 5px; }
+            .model-type-badge { font-size: 9px; padding: 1px 5px; border-radius: 4px; font-weight: 600; text-transform: uppercase; }
+            .model-type-badge.image { background: rgba(168, 85, 247, 0.18); color: #c084fc; border: 1px solid rgba(168, 85, 247, 0.3); }
+            .model-type-badge.text { background: rgba(6, 182, 212, 0.15); color: #38bdf8; border: 1px solid rgba(6, 182, 212, 0.3); }
+            .model-status { font-size: 10px; font-weight: 500; }
             .model-status.ready { color: var(--ok); }
-            .model-status.pending { color: var(--text-secondary); }
+            .model-status.pending { color: var(--text-muted); }
             .dl-btn {
               background: rgba(16, 185, 129, 0.15); border: 1px solid var(--accent); color: var(--accent);
-              padding: 4px 9px; border-radius: 6px; font-size: 11px; cursor: pointer; transition: all 0.2s; flex-shrink: 0; font-weight: 500;
+              padding: 4px 10px; border-radius: 6px; font-size: 11px; cursor: pointer; transition: all 0.2s; flex-shrink: 0; font-weight: 600;
             }
-            .dl-btn:hover { background: var(--accent); color: #fff; }
+            .dl-btn:hover { background: var(--accent); color: #fff; box-shadow: 0 0 10px var(--accent-glow); }
             .dl-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
             .system-stats {
               background: rgba(0,0,0,0.3); border: 1px solid var(--border);
-              border-radius: 12px; padding: 12px; margin-top: 8px;
-              font-size: 12px; display: flex; flex-direction: column; gap: 6px;
+              border-radius: 12px; padding: 12px; margin-top: 6px;
+              font-size: 12px; display: flex; flex-direction: column; gap: 8px;
             }
-            .stat-title { font-weight: 600; color: var(--text); margin-bottom: 2px; display: flex; align-items: center; gap: 6px; }
+            .stat-title { font-weight: 600; color: var(--text); font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; }
             .stat-row { display: flex; justify-content: space-between; align-items: center; }
-            .stat-value { font-family: monospace; font-size: 13px; }
-            #sysSpecs { color: var(--text-secondary); margin-bottom: 6px; line-height: 1.4; }
-            .progress-bar { width: 100%; height: 4px; background: rgba(255,255,255,0.1); border-radius: 2px; overflow: hidden; margin-top: 2px; }
+            .stat-value { font-family: 'JetBrains Mono', monospace; font-size: 12px; }
+            #sysSpecs { color: var(--text-muted); font-size: 11px; line-height: 1.4; border-bottom: 1px solid rgba(255,255,255,0.05); padding-bottom: 6px; }
+            .progress-bar { width: 100%; height: 5px; background: rgba(255,255,255,0.08); border-radius: 3px; overflow: hidden; margin-top: 3px; }
             .progress-fill { height: 100%; transition: width 0.3s ease; }
             
             .sidebar-footer {
@@ -512,98 +565,115 @@ jobs:
             }
             .model-tag {
               background: rgba(6, 182, 212, 0.1); color: var(--cyan); padding: 5px 10px;
-              border-radius: 6px; font-weight: 600; width: fit-content; border: 1px solid rgba(6, 182, 212, 0.2);
+              border-radius: 6px; font-weight: 600; width: fit-content; border: 1px solid rgba(6, 182, 212, 0.25);
+              max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
             }
-            .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; box-shadow: 0 0 8px currentColor; }
-            .status-dot.ok { background: var(--ok); color: var(--ok); }
-            .status-dot.bad { background: var(--danger); color: var(--danger); }
+            .status-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; }
+            .status-dot.ok { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+            .status-dot.bad { background: var(--danger); box-shadow: 0 0 8px var(--danger); }
             
             .main-content { flex: 1; display: flex; flex-direction: column; height: 100vh; position: relative; }
             .chat-container { flex: 1; overflow-y: auto; display: flex; flex-direction: column; padding: 20px 0 150px 0; scroll-behavior: smooth; }
             
             .message-row {
               width: 100%; display: flex; justify-content: center; padding: 22px 20px;
-              border-bottom: 1px solid rgba(255,255,255,0.02); animation: fadeIn 0.3s ease;
+              border-bottom: 1px solid rgba(255,255,255,0.02); animation: fadeIn 0.25s ease-out;
             }
-            @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+            @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
             .message-row.user { background: var(--user-bg); }
             .message-row.error .message-body { color: var(--danger); }
             
-            .message-inner { max-width: 850px; width: 100%; display: flex; gap: 20px; line-height: 1.7; font-size: 15px; }
+            .message-inner { max-width: 820px; width: 100%; display: flex; gap: 16px; line-height: 1.7; font-size: 15px; }
             .avatar {
-              width: 36px; height: 36px; border-radius: 10px; display: flex; align-items: center; justify-content: center;
-              font-size: 18px; font-weight: 600; flex-shrink: 0; color: #fff; box-shadow: 0 4px 10px rgba(0,0,0,0.2);
+              width: 32px; height: 32px; border-radius: 8px; display: flex; align-items: center; justify-content: center;
+              font-size: 15px; font-weight: 600; flex-shrink: 0; color: #fff;
             }
-            .avatar.user { background: linear-gradient(135deg, var(--cyan), #0284c7); }
-            .avatar.assistant { background: linear-gradient(135deg, var(--accent), #059669); }
+            .avatar.user { background: linear-gradient(135deg, var(--cyan), #0284c7); box-shadow: 0 2px 10px rgba(6, 182, 212, 0.3); }
+            .avatar.assistant { background: linear-gradient(135deg, var(--accent), #059669); box-shadow: 0 2px 10px rgba(16, 185, 129, 0.3); }
             
-            .message-body { flex: 1; overflow-x: auto; min-width: 0; padding-top: 4px; }
-            .message-body p { margin: 0 0 16px; }
+            .message-body { flex: 1; overflow-x: auto; min-width: 0; padding-top: 3px; }
+            .message-body p { margin: 0 0 14px; }
             .message-body p:last-child { margin-bottom: 0; }
-            .message-body img { max-width: 100%; height: auto; border-radius: 12px; margin: 12px 0; border: 1px solid var(--border); }
+            .message-body img { max-width: 100%; height: auto; border-radius: 12px; margin: 12px 0; border: 1px solid var(--border); box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
             .message-body pre {
-              background: var(--code-bg); color: #e2e8f0; padding: 35px 16px 16px; border-radius: 10px;
+              background: var(--code-bg); color: #e2e8f0; padding: 36px 16px 16px; border-radius: 10px;
               overflow-x: auto; margin: 16px 0; border: 1px solid var(--border); position: relative;
             }
-            .message-body code { font-family: ui-monospace, monospace; font-size: 13px; background: rgba(255,255,255,0.1); padding: 3px 6px; border-radius: 5px; }
+            .message-body code { font-family: 'JetBrains Mono', monospace; font-size: 13px; background: rgba(255,255,255,0.08); padding: 2px 5px; border-radius: 4px; }
             .message-body pre code { background: transparent; padding: 0; }
-            .code-lang { position: absolute; top: 10px; left: 16px; font-size: 12px; color: #64748b; font-weight: 500; }
+            .code-lang { position: absolute; top: 9px; left: 14px; font-size: 11px; color: var(--text-muted); font-weight: 600; text-transform: uppercase; }
             .copy-btn {
-              position: absolute; top: 8px; right: 8px; background: rgba(255,255,255,0.1); border: none;
-              color: #cbd5e1; font-size: 12px; padding: 4px 10px; border-radius: 6px; cursor: pointer; transition: 0.2s;
+              position: absolute; top: 8px; right: 8px; background: rgba(255,255,255,0.08); border: 1px solid var(--border);
+              color: #cbd5e1; font-size: 11px; padding: 4px 8px; border-radius: 5px; cursor: pointer; transition: 0.2s;
             }
-            .copy-btn:hover { background: rgba(255,255,255,0.2); color: #fff; }
+            .copy-btn:hover { background: rgba(255,255,255,0.18); color: #fff; }
             
             .input-area-wrapper {
               position: absolute; bottom: 0; left: 0; width: 100%;
-              background: linear-gradient(180deg, transparent 0%, var(--bg) 30%);
-              padding: 30px 24px; display: flex; justify-content: center;
+              background: linear-gradient(180deg, transparent 0%, var(--bg) 40%);
+              padding: 24px; display: flex; justify-content: center;
             }
             .input-box {
-              max-width: 850px; width: 100%; background: var(--input-bg); border: 1px solid var(--border);
-              border-radius: 18px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); display: flex; align-items: flex-end;
+              max-width: 820px; width: 100%; background: var(--input-bg); border: 1px solid var(--border);
+              border-radius: 16px; box-shadow: 0 10px 35px rgba(0,0,0,0.6); display: flex; align-items: flex-end;
               padding: 12px 16px; gap: 12px; backdrop-filter: var(--glass); -webkit-backdrop-filter: var(--glass);
-              transition: border-color 0.3s ease;
+              transition: border-color 0.25s ease;
             }
             .input-box:focus-within { border-color: var(--accent); }
             .input-box textarea {
               flex: 1; background: transparent; border: none; color: var(--text); font-family: inherit;
-              font-size: 15px; resize: none; outline: none; max-height: 200px; min-height: 26px; line-height: 26px;
+              font-size: 14.5px; resize: none; outline: none; max-height: 200px; min-height: 26px; line-height: 26px;
             }
-            .input-box textarea::placeholder { color: #52525b; }
+            .input-box textarea::placeholder { color: var(--text-muted); }
             .send-btn, .stop-btn {
-              border: none; border-radius: 12px; width: 40px; height: 40px; display: flex; align-items: center;
-              justify-content: center; color: #fff; cursor: pointer; transition: all 0.2s; flex-shrink: 0; font-size: 18px;
+              border: none; border-radius: 10px; width: 38px; height: 38px; display: flex; align-items: center;
+              justify-content: center; color: #fff; cursor: pointer; transition: all 0.2s; flex-shrink: 0; font-size: 16px;
             }
-            .send-btn { background: var(--accent); box-shadow: 0 4px 12px var(--accent-glow); }
-            .stop-btn { background: var(--danger); display: none; box-shadow: 0 4px 12px rgba(239, 68, 68, 0.3); }
-            .send-btn:hover { background: #059669; }
-            .stop-btn:hover { background: #dc2626; }
+            .send-btn { background: var(--accent); box-shadow: 0 2px 10px var(--accent-glow); }
+            .stop-btn { background: var(--danger); display: none; box-shadow: 0 2px 10px rgba(239, 68, 68, 0.3); }
+            .send-btn:hover { background: #059669; transform: translateY(-1px); }
+            .stop-btn:hover { background: #dc2626; transform: translateY(-1px); }
             .send-btn:disabled { opacity: 0.5; cursor: not-allowed; }
             
-            /* Modal */
             .modal-overlay {
-              position: fixed; inset: 0; background: rgba(0,0,0,0.8); backdrop-filter: blur(8px);
+              position: fixed; inset: 0; background: rgba(0,0,0,0.85); backdrop-filter: blur(10px);
               display: none; align-items: center; justify-content: center; z-index: 100;
             }
             .modal-box {
-              background: #18181b; border: 1px solid var(--border); border-radius: 16px;
-              width: 90%; max-width: 520px; padding: 24px; display: flex; flex-direction: column; gap: 16px;
-              box-shadow: 0 20px 40px rgba(0,0,0,0.6);
+              background: #141419; border: 1px solid var(--border); border-radius: 18px;
+              width: 92%; max-width: 540px; padding: 24px; display: flex; flex-direction: column; gap: 18px;
+              box-shadow: 0 25px 60px rgba(0,0,0,0.8);
             }
-            .modal-title { font-size: 16px; font-weight: 600; color: var(--text); }
-            .modal-log {
-              background: #09090b; border: 1px solid var(--border); border-radius: 8px;
-              padding: 12px; font-family: monospace; font-size: 12px; color: #a1a1aa;
-              height: 140px; overflow-y: auto; white-space: pre-wrap; line-height: 1.5;
+            .modal-header { display: flex; justify-content: space-between; align-items: center; }
+            .modal-title { font-size: 15px; font-weight: 600; color: #fff; display: flex; align-items: center; gap: 8px; }
+            
+            .metric-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+            .metric-card {
+              background: rgba(0,0,0,0.4); border: 1px solid var(--border); border-radius: 10px;
+              padding: 10px 12px; display: flex; flex-direction: column; gap: 3px;
             }
-            .dl-modal-bar { width: 100%; height: 8px; background: rgba(255,255,255,0.1); border-radius: 4px; overflow: hidden; }
-            .dl-modal-fill { height: 100%; background: var(--cyan); width: 0%; transition: width 0.2s ease; }
+            .metric-label { font-size: 10px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; }
+            .metric-val { font-family: 'JetBrains Mono', monospace; font-size: 13px; font-weight: 600; color: var(--cyan); }
+            
+            .dl-bar-container { display: flex; flex-direction: column; gap: 6px; }
+            .dl-modal-bar { width: 100%; height: 7px; background: rgba(255,255,255,0.08); border-radius: 4px; overflow: hidden; }
+            .dl-modal-fill { height: 100%; background: linear-gradient(90deg, var(--cyan), var(--accent)); width: 0%; transition: width 0.25s ease-out; }
+            .dl-bar-info { display: flex; justify-content: space-between; font-size: 12px; color: var(--text-secondary); }
+            
+            .terminal-container {
+              background: #09090b; border: 1px solid var(--border); border-radius: 10px;
+              padding: 12px; height: 130px; overflow-y: auto; font-family: 'JetBrains Mono', monospace;
+              font-size: 11.5px; color: #94a3b8; line-height: 1.6; display: flex; flex-direction: column;
+            }
+            .terminal-line { word-break: break-all; }
+            .terminal-line.success { color: var(--ok); font-weight: 600; }
+            .terminal-line.error { color: var(--danger); font-weight: 600; }
+            
             .modal-close-btn {
-              align-self: flex-end; background: var(--border); border: none; color: var(--text);
-              padding: 8px 18px; border-radius: 8px; cursor: pointer; font-size: 13px; font-weight: 500;
+              align-self: flex-end; background: rgba(255,255,255,0.08); border: 1px solid var(--border); color: #fff;
+              padding: 8px 20px; border-radius: 8px; cursor: pointer; font-size: 12.5px; font-weight: 500; transition: all 0.2s;
             }
-            .modal-close-btn:hover { background: rgba(255,255,255,0.2); }
+            .modal-close-btn:hover { background: rgba(255,255,255,0.18); }
           </style>
           </head>
           <body>
@@ -611,70 +681,93 @@ jobs:
             
             <div class="modal-overlay" id="downloadModal">
               <div class="modal-box">
-                <div class="modal-title" id="modalTitle">📥 Downloading Model</div>
-                <div class="dl-modal-bar"><div class="dl-modal-fill" id="modalBar"></div></div>
-                <div style="display:flex; justify-content:space-between; font-size:12px; color:var(--text-secondary);">
-                  <span id="modalStatus">Connecting...</span>
-                  <span id="modalPercent">0%</span>
+                <div class="modal-header">
+                  <div class="modal-title"><span id="modalIcon">📥</span> <span id="modalTitle">Pulling Model</span></div>
+                  <span id="modalPercent" style="font-family:'JetBrains Mono',monospace; font-size:14px; font-weight:700; color:var(--cyan);">0%</span>
                 </div>
-                <div class="modal-log" id="modalLogs"></div>
+                
+                <div class="metric-grid">
+                  <div class="metric-card">
+                    <span class="metric-label">Speed</span>
+                    <span class="metric-val" id="metricSpeed">-- MB/s</span>
+                  </div>
+                  <div class="metric-card">
+                    <span class="metric-label">Size</span>
+                    <span class="metric-val" id="metricSize">-- / --</span>
+                  </div>
+                  <div class="metric-card">
+                    <span class="metric-label">ETA</span>
+                    <span class="metric-val" id="metricEta">--</span>
+                  </div>
+                </div>
+
+                <div class="dl-bar-container">
+                  <div class="dl-modal-bar"><div class="dl-modal-fill" id="modalBar"></div></div>
+                  <div class="dl-bar-info">
+                    <span id="modalStatus" style="font-size:11.5px;">Connecting...</span>
+                  </div>
+                </div>
+
+                <div class="terminal-container" id="modalLogs"></div>
                 <button class="modal-close-btn" id="modalCloseBtn" onclick="closeModal()" disabled>Downloading...</button>
               </div>
             </div>
 
             <div class="sidebar">
+              <div class="brand-header">
+                <div class="brand-logo">🦙</div>
+                <div class="brand-name">Local Studio</div>
+                <span class="brand-badge">MLX</span>
+              </div>
+
               <button class="new-chat-btn" onclick="clearChat()"><span>＋</span> New Chat</button>
               
               <div class="settings-group">
                 <div class="model-section-title">
-                  <span>Model Selector & Library</span>
-                  <button onclick="loadModels()" style="background:none; border:none; color:var(--cyan); cursor:pointer; font-size:11px;">🔄 Refresh</button>
+                  <span>Model Selector</span>
+                  <button onclick="loadModels()" style="background:none; border:none; color:var(--cyan); cursor:pointer; font-size:11px; font-weight:600;">🔄 Refresh</button>
                 </div>
                 <div class="model-list" id="modelListContainer">
-                  <div style="padding: 10px; text-align: center; color: var(--text-secondary);">Scanning models...</div>
+                  <div style="padding: 10px; text-align: center; color: var(--text-muted);">Scanning repository...</div>
                 </div>
 
                 <div>
-                  <label>Temperature <span id="tempVal" style="color: var(--cyan);">0.7</span></label>
+                  <label>Temperature <span id="tempVal" style="color: var(--cyan); font-family:monospace;">0.7</span></label>
                   <input type="range" id="temperature" min="0" max="2" step="0.1" value="0.7">
                 </div>
                 
                 <div>
-                  <label>Max Tokens <span id="tokenVal" style="color: var(--cyan);">2048</span></label>
-                  <input type="range" id="maxTokens" min="128" max="4096" step="128" value="2048">
+                  <label>Max Tokens <span id="tokenVal" style="color: var(--cyan); font-family:monospace;">2048</span></label>
+                  <input type="range" id="maxTokens" min="128" max="8192" step="128" value="2048">
                 </div>
               </div>
 
-              <!-- System Resource Monitor -->
               <div class="system-stats">
-                <div class="stat-title">🖥️ Server Hardware</div>
-                <div id="sysSpecs">Loading...</div>
-                
-                <div class="stat-title" style="margin-top: 6px;">📊 Live Usage</div>
+                <div class="stat-title">🖥️ Server Resources</div>
+                <div id="sysSpecs">Loading hardware...</div>
                 
                 <div class="stat-row">
-                  <span>CPU:</span>
+                  <span>CPU Usage:</span>
                   <span id="cpuVal" class="stat-value" style="color: var(--cyan);">0%</span>
                 </div>
                 <div class="progress-bar"><div id="cpuBar" class="progress-fill" style="background: var(--cyan); width: 0%;"></div></div>
                 
-                <div class="stat-row" style="margin-top: 6px;">
-                  <span>RAM:</span>
+                <div class="stat-row" style="margin-top: 4px;">
+                  <span>RAM Usage:</span>
                   <span id="ramVal" class="stat-value" style="color: var(--accent);">0%</span>
                 </div>
                 <div class="progress-bar"><div id="ramBar" class="progress-fill" style="background: var(--accent); width: 0%;"></div></div>
                 
-                <div class="stat-row" style="margin-top: 6px;">
-                  <span>Disk Free:</span>
+                <div class="stat-row" style="margin-top: 4px;">
+                  <span>Storage Free:</span>
                   <span id="diskFreeVal" class="stat-value" style="color: var(--ok);">0 GB</span>
                 </div>
-                <div id="ramUsedText" style="text-align: right; font-size: 10px; color: var(--text-secondary); margin-top: 2px;">0 GB Used</div>
               </div>
 
               <div class="sidebar-footer">
                 <span class="model-tag" id="currentModelTag">📦 Loading...</span>
-                <span id="statusIndicator"><span class="status-dot ok"></span>Checking connection...</span>
-                <span id="tokenCounter" style="color: var(--cyan);">Tokens generated: 0</span>
+                <span id="statusIndicator"><span class="status-dot ok"></span>Connecting to backend...</span>
+                <span id="tokenCounter" style="color: var(--cyan); font-family: 'JetBrains Mono', monospace; font-size: 11px;">Tokens generated: 0</span>
               </div>
             </div>
 
@@ -689,7 +782,7 @@ jobs:
               </div>
               <div class="input-area-wrapper">
                 <div class="input-box">
-                  <textarea id="userInput" placeholder="Message or enter image prompt..." rows="1"></textarea>
+                  <textarea id="userInput" placeholder="Ask a question or enter an image prompt..." rows="1"></textarea>
                   <button class="send-btn" id="sendButton" onclick="sendMessage()">↑</button>
                   <button class="stop-btn" id="stopButton" onclick="stopGenerating()">■</button>
                 </div>
@@ -697,8 +790,6 @@ jobs:
             </div>
 
           <script>
-            if (window.innerWidth <= 768) { document.querySelector('.menu-btn').style.display = 'flex'; }
-
             marked.setOptions({
               gfm: true, breaks: true,
               highlight: function (code, lang) {
@@ -721,7 +812,7 @@ jobs:
               }
             }
 
-            const STORE_KEY = 'studio-hybrid-mlx-v4';
+            const STORE_KEY = 'studio-hybrid-clean-v1';
             const chatContainer = document.getElementById('chatContainer');
             const userInput = document.getElementById('userInput');
             const sendButton = document.getElementById('sendButton');
@@ -740,6 +831,9 @@ jobs:
             const modalPercent = document.getElementById('modalPercent');
             const modalLogs = document.getElementById('modalLogs');
             const modalCloseBtn = document.getElementById('modalCloseBtn');
+            const metricSpeed = document.getElementById('metricSpeed');
+            const metricSize = document.getElementById('metricSize');
+            const metricEta = document.getElementById('metricEta');
 
             let isStreaming = false, totalTokens = 0, messageHistory = [], controller = null, currentModel = null, currentModelType = 'text';
             let statPollInterval;
@@ -748,7 +842,7 @@ jobs:
               try {
                 const r = await fetch('/api/sysinfo');
                 const data = await r.json();
-                document.getElementById('sysSpecs').innerHTML = `OS: ${data.os}<br>CPU: ${data.cpu_threads} Cores<br>RAM: ${data.ram_total}`;
+                document.getElementById('sysSpecs').innerHTML = `OS: ${data.os}<br>CPU: ${data.cpu_threads} Threads<br>Memory: ${data.ram_total}`;
               } catch (e) {
                 document.getElementById('sysSpecs').innerText = "Unavailable";
               }
@@ -763,7 +857,6 @@ jobs:
                 document.getElementById('ramVal').textContent = data.ram_percent.toFixed(1) + '%';
                 document.getElementById('ramBar').style.width = data.ram_percent + '%';
                 document.getElementById('diskFreeVal').textContent = data.disk_free;
-                document.getElementById('ramUsedText').textContent = data.ram_used + ' Used';
               } catch (e) {}
             }
 
@@ -784,14 +877,14 @@ jobs:
                 const models = data.models || [];
                 
                 if (models.length === 0) {
-                  modelListContainer.innerHTML = '<div style="padding: 10px; text-align: center; color: var(--text-secondary);">No models found</div>';
+                  modelListContainer.innerHTML = '<div style="padding: 10px; text-align: center; color: var(--text-muted);">No models available</div>';
                   return;
                 }
 
                 modelListContainer.innerHTML = models.map(m => `
                   <div class="model-item ${m.name === currentModel ? 'active' : ''}" onclick="${m.downloaded ? `selectModel('${m.name}', '${m.type}')` : ''}">
                     <div class="model-meta">
-                      <div style="display:flex; align-items:center; gap:6px;">
+                      <div class="model-badges">
                         <span class="model-name" title="${m.name}">${m.name}</span>
                         <span class="model-type-badge ${m.type}">${m.type}</span>
                       </div>
@@ -818,8 +911,11 @@ jobs:
               loadModels();
             }
 
-            function appendLog(msg, isError = false) {
-              modalLogs.textContent += (isError ? '❌ ' : '') + msg + '\n';
+            function appendTerminalLog(msg, type = 'normal') {
+              const line = document.createElement('div');
+              line.className = 'terminal-line ' + type;
+              line.textContent = msg;
+              modalLogs.appendChild(line);
               modalLogs.scrollTop = modalLogs.scrollHeight;
             }
 
@@ -831,12 +927,15 @@ jobs:
               if (event) event.stopPropagation();
               
               downloadModal.style.display = 'flex';
-              modalTitle.textContent = `📥 Pulling ${modelName}`;
+              modalTitle.textContent = `${modelName}`;
               modalBar.style.width = '0%';
-              modalBar.style.background = 'var(--cyan)';
               modalPercent.textContent = '0%';
               modalStatus.textContent = 'Connecting to Ollama repository...';
-              modalLogs.textContent = `[Info] Running resume-capable pull for: ${modelName}\n`;
+              metricSpeed.textContent = '-- MB/s';
+              metricSize.textContent = '-- / --';
+              metricEta.textContent = '--';
+              modalLogs.innerHTML = '';
+              appendTerminalLog(`[Init] Establishing connection for ${modelName}...`);
               modalCloseBtn.disabled = true;
               modalCloseBtn.textContent = 'Downloading...';
 
@@ -884,20 +983,23 @@ jobs:
 
                     if (data.error) {
                       streamFailed = true;
-                      appendLog(`[Error] ${data.error}`, true);
-                      modalStatus.textContent = 'Failed: ' + data.error;
+                      appendTerminalLog(`[Error] ${data.error}`, 'error');
+                      modalStatus.textContent = 'Download failed.';
                       modalBar.style.background = 'var(--danger)';
                       break pullLoop;
                     }
                     
-                    if (data.status) {
-                      modalStatus.textContent = data.status;
-                      appendLog(`[Status] ${data.status}`);
-                      if (data.percent !== undefined) {
-                        modalBar.style.width = data.percent + '%';
-                        modalPercent.textContent = data.percent + '%';
-                      }
+                    if (data.raw) {
+                      modalStatus.textContent = data.raw;
+                      appendTerminalLog(data.raw);
                     }
+                    if (data.percent !== null && data.percent !== undefined) {
+                      modalBar.style.width = data.percent + '%';
+                      modalPercent.textContent = data.percent + '%';
+                    }
+                    if (data.speed) metricSpeed.textContent = data.speed;
+                    if (data.size) metricSize.textContent = data.size;
+                    if (data.eta) metricEta.textContent = data.eta;
                   }
                 }
 
@@ -910,10 +1012,9 @@ jobs:
                 }
 
                 modalBar.style.width = '100%';
-                modalBar.style.background = 'var(--ok)';
                 modalPercent.textContent = '100%';
-                modalStatus.textContent = 'Completed successfully!';
-                appendLog(`[Success] Model ${modelName} ready.`);
+                modalStatus.textContent = 'Model successfully downloaded and verified!';
+                appendTerminalLog(`[Success] Verified integrity for ${modelName}`, 'success');
                 modalCloseBtn.disabled = false;
                 modalCloseBtn.textContent = 'Done & Select';
                 modalCloseBtn.onclick = () => {
@@ -924,8 +1025,8 @@ jobs:
 
               } catch (err) {
                 modalBar.style.background = 'var(--danger)';
-                appendLog(`[Failed] ${err.message || 'Network error'}`, true);
-                modalStatus.textContent = 'Download error.';
+                appendTerminalLog(`[Network Error] ${err.message || 'Connection lost'}`, 'error');
+                modalStatus.textContent = 'Interrupted.';
                 modalCloseBtn.disabled = false;
                 modalCloseBtn.textContent = 'Close';
                 modalCloseBtn.onclick = closeModal;
@@ -965,8 +1066,8 @@ jobs:
             async function checkHealth() {
               try {
                 const r = await fetch('/api/health');
-                statusIndicator.innerHTML = r.ok ? '<span class="status-dot ok"></span>Connected to Engine' : '<span class="status-dot bad"></span>Engine unreachable';
-              } catch { statusIndicator.innerHTML = '<span class="status-dot bad"></span>Engine unreachable'; }
+                statusIndicator.innerHTML = r.ok ? '<span class="status-dot ok"></span>Engine Online' : '<span class="status-dot bad"></span>Engine Offline';
+              } catch { statusIndicator.innerHTML = '<span class="status-dot bad"></span>Engine Offline'; }
             }
 
             checkHealth(); setInterval(checkHealth, 15000);
@@ -1086,7 +1187,7 @@ jobs:
             loadModels().then(() => {
               restoreState();
               const welcome = document.getElementById('welcomeMsg');
-              renderInto(welcome, `System initialized. Select or download any model from the sidebar to begin.`);
+              renderInto(welcome, `System initialized with verified MLX image & language runtimes. Select or download any model from the sidebar to begin.`);
             });
           </script>
           </body>
