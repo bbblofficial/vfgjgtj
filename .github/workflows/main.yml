@@ -1,4 +1,4 @@
-name: 🦙 Local LLM & Vision Studio (Optimized Cloud Runner)
+name: 🦙 Local LLM & Image Studio (macOS Apple Silicon / MLX)
 
 on:
   workflow_dispatch:
@@ -34,12 +34,13 @@ jobs:
       - name: 🦙 Show banner
         run: |
           echo "╔═══════════════════════════════════════════════════════════════════╗"
-          echo "║   🦙  L O C A L   L L M   &   V I S I O N   S T U D I O           ║"
+          echo "║   🦙  M A C O S   A P P L E   S I L I C O N   ( M L X )           ║"
           echo "╚═══════════════════════════════════════════════════════════════════╝"
           echo "  📝 Context: ${CONTEXT_SIZE} tokens"
           echo "  🔌 Port:    ${PORT}"
           echo "  🏃 Runner:  $(uname -a)"
-          echo "  💽 Disk available:"
+          echo "  🧠 Chip:    $(sysctl -n machdep.cpu.brand_string 2>/dev/null || uname -m)"
+          echo "  💽 Disk status:"
           df -h / | tail -1
           mkdir -p /Users/runner/ollama_models
 
@@ -48,40 +49,44 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: 📦 Install Ollama & Python packages
+      - name: 📦 Install Complete Ollama.app Bundle & Python packages
         run: |
           echo "──────────────────────────────────────────"
-          echo " 📦  Installing Official Ollama Engine"
+          echo " 📦 Installing Full Ollama Bundle & Python Dependencies"
           echo "──────────────────────────────────────────"
+          # Download and unpack the complete application bundle to retain llama-server and MLX runtime
           curl -fsSL https://github.com/ollama/ollama/releases/latest/download/Ollama-darwin.zip -o /tmp/Ollama-darwin.zip
-          unzip -q /tmp/Ollama-darwin.zip -d /tmp/ollama_app
-          sudo cp /tmp/ollama_app/Ollama.app/Contents/Resources/ollama /usr/local/bin/ollama
-          sudo chmod +x /usr/local/bin/ollama
-          rm -rf /tmp/Ollama-darwin.zip /tmp/ollama_app
+          sudo unzip -q /tmp/Ollama-darwin.zip -d /Applications/
+          sudo ln -sf /Applications/Ollama.app/Contents/Resources/ollama /usr/local/bin/ollama
+          rm -f /tmp/Ollama-darwin.zip
+
+          # Verify llama-server exists in bundle
+          find /Applications/Ollama.app -name "llama-server"
 
           pip install --no-cache-dir \
             fastapi uvicorn aiohttp httpx python-multipart \
-            jinja2 websockets pydantic psutil
+            jinja2 websockets pydantic psutil mlx
 
-          /usr/local/bin/ollama --version
+          ollama --version
+          python -c "import mlx.core as mx; print('✅ MLX Framework Ready:', mx.default_device())"
 
-      - name: 🚀 Start Ollama server
+      - name: 🚀 Start Ollama engine
         run: |
           echo "──────────────────────────────────────────"
-          echo " 🚀  Starting Ollama Engine"
+          echo " 🚀 Starting Ollama with Full App Bundle Context"
           echo "──────────────────────────────────────────"
           export OLLAMA_MODELS="/Users/runner/ollama_models"
           export OLLAMA_HOST="0.0.0.0:11434"
           export OLLAMA_KEEP_ALIVE="24h"
           
-          nohup /usr/local/bin/ollama serve > /tmp/ollama.log 2>&1 &
+          nohup /Applications/Ollama.app/Contents/Resources/ollama serve > /tmp/ollama.log 2>&1 &
           echo $! > /tmp/ollama.pid
           
           echo "⏳ Waiting for Ollama engine to report healthy..."
           ready=false
           for i in $(seq 1 30); do
             if curl -sf http://localhost:11434/api/tags > /dev/null 2>&1; then
-              echo "✅ Ollama is ready!"
+              echo "✅ Ollama Engine & Backends Active!"
               ready=true
               break
             fi
@@ -89,19 +94,29 @@ jobs:
           done
           
           if [ "$ready" != "true" ]; then
-            echo "❌ Ollama failed to start. Last logs:"
+            echo "❌ Ollama failed to start. Logs:"
             tail -n 50 /tmp/ollama.log || true
             exit 1
           fi
 
-      - name: 🔧 Write the web server (Glassmorphism Web UI)
+      - name: 📥 Verify Repository state
+        run: |
+          echo "──────────────────────────────────────────"
+          echo " 📥 Initial Repository State"
+          echo "──────────────────────────────────────────"
+          ollama list
+
+      - name: 🔧 Write the web server (Unified Text & Image Studio)
         run: |
           cat > ollama_server.py << 'PYEOF'
           #!/usr/bin/env python3
           import json
           import os
+          import glob
+          import base64
           import logging
           import platform
+          import subprocess
           import psutil
           from typing import Optional, List
           import httpx
@@ -117,16 +132,19 @@ jobs:
           CONTEXT_SIZE = int(os.getenv("CONTEXT_SIZE", "4096"))
           PORT = int(os.getenv("PORT", "7860"))
 
-          app = FastAPI(title="Local LLM Studio")
+          app = FastAPI(title="Local Studio (MLX Hybrid)")
 
-          # Verified Models Catalog Compatible with Cloud Virtual Runners
           CATALOG_MODELS = [
-              # Vision, OCR & Media
+              # Experimental Image Generation Models (macOS MLX Engine)
+              "x/z-image-turbo:latest",
+              "x/flux2-klein:latest",
               "flux2-klein:4b",
+
+              # OCR & Document Models
               "deepseek-ocr:latest",
               "it:deepseek-ocr:latest",
 
-              # Fine-tuned & Specialized
+              # Community & Fine-tuned
               "goonsai/qwen2.5-3b-goonsai-nsfw-100k:latest",
               "REOinc/REO.AI:latest",
               "MrTails/Tails-assistant-ai-v3.0.0:latest",
@@ -137,7 +155,7 @@ jobs:
               "parable/fable:3b",
               "parable/fable:4b",
 
-              # Conversational & Code LLMs
+              # Standard Conversational & Coding LLMs
               "qwen2.5:0.5b",
               "qwen2.5:1.5b",
               "qwen2.5:3b",
@@ -163,6 +181,12 @@ jobs:
               "orca-mini:3b",
               "stablelm2:1.6b"
           ]
+
+          IMAGE_MODEL_PREFIXES = ("x/z-image", "x/flux", "flux", "stable-diffusion")
+
+          def is_image_model(model_name: str) -> bool:
+              m = model_name.lower()
+              return any(p in m for p in IMAGE_MODEL_PREFIXES)
 
           class ChatMessage(BaseModel):
               role: str
@@ -192,7 +216,7 @@ jobs:
               return {
                   "cpu_threads": psutil.cpu_count(logical=True),
                   "ram_total": f"{psutil.virtual_memory().total / (1024**3):.1f} GB",
-                  "os": platform.system() + " " + platform.release()
+                  "os": platform.system() + " " + platform.release() + " (Apple Silicon / MLX)"
               }
 
           @app.get("/api/stats")
@@ -226,7 +250,8 @@ jobs:
                       for m in all_models:
                           result.append({
                               "name": m,
-                              "downloaded": m in downloaded
+                              "downloaded": m in downloaded,
+                              "type": "image" if is_image_model(m) else "text"
                           })
                       return {"models": result}
               except Exception as exc:
@@ -263,9 +288,40 @@ jobs:
 
           @app.post("/api/chat")
           async def chat(request: ChatRequest):
-              ollama_messages = [{"role": m.role, "content": m.content} for m in request.messages]
               async def generate():
                   try:
+                      # If it's an image model, execute via subprocess to capture output files accurately
+                      if is_image_model(request.model):
+                          prompt = request.messages[-1].content if request.messages else ""
+                          yield f"data: {json.dumps({'content': '🎨 Generating image with **' + request.model + '**...\\n\\n'})}\n\n"
+
+                          before_images = set(glob.glob("*.png") + glob.glob("*.jpg") + glob.glob("*.jpeg"))
+                          
+                          # Run CLI prompt execution
+                          cmd = ["/Applications/Ollama.app/Contents/Resources/ollama", "run", request.model, prompt]
+                          process = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                          
+                          after_images = set(glob.glob("*.png") + glob.glob("*.jpg") + glob.glob("*.jpeg"))
+                          new_images = list(after_images - before_images)
+                          
+                          if new_images:
+                              latest_img = new_images[-1]
+                              with open(latest_img, "rb") as f:
+                                  b64_data = base64.b64encode(f.read()).decode("utf-8")
+                              img_md = f"![Generated Image](data:image/png;base64,{b64_data})\n\n*Saved as: `{latest_img}`*"
+                              yield f"data: {json.dumps({'content': img_md})}\n\n"
+                          elif process.stdout:
+                              yield f"data: {json.dumps({'content': process.stdout})}\n\n"
+                          elif process.stderr:
+                              yield f"data: {json.dumps({'error': process.stderr})}\n\n"
+                          else:
+                              yield f"data: {json.dumps({'content': 'Image generation finished.'})}\n\n"
+
+                          yield "data: [DONE]\n\n"
+                          return
+
+                      # Standard LLM Chat Handling
+                      ollama_messages = [{"role": m.role, "content": m.content} for m in request.messages]
                       async with httpx.AsyncClient(timeout=300) as client:
                           async with client.stream(
                               "POST",
@@ -301,7 +357,7 @@ jobs:
                                   if content:
                                       yield f"data: {json.dumps({'content': content})}\n\n"
                   except Exception as exc:
-                      logger.exception("inference execution failed")
+                      logger.exception("execution error")
                       yield f"data: {json.dumps({'error': str(exc)})}\n\n"
                   yield "data: [DONE]\n\n"
               return StreamingResponse(generate(), media_type="text/event-stream")
@@ -312,7 +368,7 @@ jobs:
           <head>
           <meta charset="UTF-8">
           <meta name="viewport" content="width=device-width, initial-scale=1.0">
-          <title>Local Studio</title>
+          <title>Local Studio (MLX Hybrid)</title>
           
           <link rel="preconnect" href="https://fonts.googleapis.com">
           <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -336,6 +392,7 @@ jobs:
               --accent: #10b981;
               --accent-glow: rgba(16, 185, 129, 0.3);
               --cyan: #06b6d4;
+              --purple: #a855f7;
               --user-bg: rgba(6, 182, 212, 0.05);
               --assistant-bg: transparent;
               --input-bg: rgba(24, 24, 27, 0.75);
@@ -381,7 +438,10 @@ jobs:
             .model-item:hover { background: rgba(255,255,255,0.05); }
             .model-item.active { background: rgba(6, 182, 212, 0.12); border-color: rgba(6, 182, 212, 0.4); }
             .model-meta { display: flex; flex-direction: column; gap: 2px; overflow: hidden; }
-            .model-name { font-weight: 500; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 170px; }
+            .model-name { font-weight: 500; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 155px; }
+            .model-type-badge { font-size: 9px; padding: 2px 4px; border-radius: 4px; width: fit-content; text-transform: uppercase; }
+            .model-type-badge.image { background: rgba(168, 85, 247, 0.2); color: var(--purple); }
+            .model-type-badge.text { background: rgba(6, 182, 212, 0.2); color: var(--cyan); }
             .model-status { font-size: 11px; }
             .model-status.ready { color: var(--ok); }
             .model-status.pending { color: var(--text-secondary); }
@@ -438,6 +498,7 @@ jobs:
             .message-body { flex: 1; overflow-x: auto; min-width: 0; padding-top: 4px; }
             .message-body p { margin: 0 0 16px; }
             .message-body p:last-child { margin-bottom: 0; }
+            .message-body img { max-width: 100%; height: auto; border-radius: 12px; margin: 12px 0; border: 1px solid var(--border); }
             .message-body pre {
               background: var(--code-bg); color: #e2e8f0; padding: 35px 16px 16px; border-radius: 10px;
               overflow-x: auto; margin: 16px 0; border: 1px solid var(--border); position: relative;
@@ -586,7 +647,7 @@ jobs:
               </div>
               <div class="input-area-wrapper">
                 <div class="input-box">
-                  <textarea id="userInput" placeholder="Message or prompt..." rows="1"></textarea>
+                  <textarea id="userInput" placeholder="Message or enter image prompt..." rows="1"></textarea>
                   <button class="send-btn" id="sendButton" onclick="sendMessage()">↑</button>
                   <button class="stop-btn" id="stopButton" onclick="stopGenerating()">■</button>
                 </div>
@@ -618,7 +679,7 @@ jobs:
               }
             }
 
-            const STORE_KEY = 'llama-ui-glass-native';
+            const STORE_KEY = 'studio-hybrid-mlx-v1';
             const chatContainer = document.getElementById('chatContainer');
             const userInput = document.getElementById('userInput');
             const sendButton = document.getElementById('sendButton');
@@ -638,7 +699,7 @@ jobs:
             const modalLogs = document.getElementById('modalLogs');
             const modalCloseBtn = document.getElementById('modalCloseBtn');
 
-            let isStreaming = false, totalTokens = 0, messageHistory = [], controller = null, currentModel = null;
+            let isStreaming = false, totalTokens = 0, messageHistory = [], controller = null, currentModel = null, currentModelType = 'text';
             let statPollInterval;
 
             async function fetchSysInfo() {
@@ -686,9 +747,12 @@ jobs:
                 }
 
                 modelListContainer.innerHTML = models.map(m => `
-                  <div class="model-item ${m.name === currentModel ? 'active' : ''}" onclick="${m.downloaded ? `selectModel('${m.name}')` : ''}">
+                  <div class="model-item ${m.name === currentModel ? 'active' : ''}" onclick="${m.downloaded ? `selectModel('${m.name}', '${m.type}')` : ''}">
                     <div class="model-meta">
-                      <span class="model-name" title="${m.name}">${m.name}</span>
+                      <div style="display:flex; align-items:center; gap:6px;">
+                        <span class="model-name" title="${m.name}">${m.name}</span>
+                        <span class="model-type-badge ${m.type}">${m.type}</span>
+                      </div>
                       <span class="model-status ${m.downloaded ? 'ready' : 'pending'}">${m.downloaded ? '🟢 Ready' : '📥 Not Downloaded'}</span>
                     </div>
                     ${!m.downloaded ? `<button class="dl-btn" onclick="startModelDownload('${m.name}', event)">Download</button>` : ''}
@@ -697,15 +761,16 @@ jobs:
 
                 const downloaded = models.filter(m => m.downloaded);
                 if (!currentModel && downloaded.length > 0) {
-                  selectModel(downloaded[0].name);
+                  selectModel(downloaded[0].name, downloaded[0].type);
                 }
               } catch (e) {
                 modelListContainer.innerHTML = '<div style="padding: 10px; text-align: center; color: var(--danger);">Error loading models</div>';
               }
             }
 
-            function selectModel(modelName) {
+            function selectModel(modelName, modelType = 'text') {
               currentModel = modelName;
+              currentModelType = modelType;
               updateModelTag();
               saveState();
               loadModels();
@@ -832,14 +897,14 @@ jobs:
             }
 
             function updateModelTag() {
-              currentModelTag.textContent = currentModel ? `📦 ${currentModel}` : '📦 (no model selected)';
+              currentModelTag.textContent = currentModel ? `📦 ${currentModel} (${currentModelType})` : '📦 (no model selected)';
             }
 
             function saveState() {
               try {
                 localStorage.setItem(STORE_KEY, JSON.stringify({
                   temperature: temperatureEl.value, maxTokens: maxTokensEl.value,
-                  messageHistory, totalTokens, model: currentModel
+                  messageHistory, totalTokens, model: currentModel, modelType: currentModelType
                 }));
               } catch { }
             }
@@ -851,7 +916,7 @@ jobs:
                 const s = JSON.parse(raw);
                 if (s.temperature) { temperatureEl.value = s.temperature; document.getElementById('tempVal').textContent = s.temperature; }
                 if (s.maxTokens) { maxTokensEl.value = s.maxTokens; document.getElementById('tokenVal').textContent = s.maxTokens; }
-                if (s.model) { currentModel = s.model; updateModelTag(); }
+                if (s.model) { currentModel = s.model; currentModelType = s.modelType || 'text'; updateModelTag(); }
                 if (Array.isArray(s.messageHistory)) {
                   messageHistory = s.messageHistory; totalTokens = s.totalTokens || 0;
                   messageHistory.forEach(m => appendMessage(m.role, m.content));
@@ -863,8 +928,8 @@ jobs:
             async function checkHealth() {
               try {
                 const r = await fetch('/api/health');
-                statusIndicator.innerHTML = r.ok ? '<span class="status-dot ok"></span>Connected to Ollama' : '<span class="status-dot bad"></span>Ollama unreachable';
-              } catch { statusIndicator.innerHTML = '<span class="status-dot bad"></span>Ollama unreachable'; }
+                statusIndicator.innerHTML = r.ok ? '<span class="status-dot ok"></span>Connected to Engine' : '<span class="status-dot bad"></span>Engine unreachable';
+              } catch { statusIndicator.innerHTML = '<span class="status-dot bad"></span>Engine unreachable'; }
             }
 
             checkHealth(); setInterval(checkHealth, 15000);
@@ -921,7 +986,7 @@ jobs:
               userInput.value = ''; userInput.style.height = 'auto';
               sendButton.style.display = 'none'; stopButton.style.display = 'flex';
               isStreaming = true; controller = new AbortController();
-              appendMessage('assistant', 'Processing...', true);
+              appendMessage('assistant', currentModelType === 'image' ? 'Generating Image...' : 'Processing...', true);
 
               setPolling(true);
 
@@ -999,7 +1064,7 @@ jobs:
       - name: 🌐 Start web server
         run: |
           echo "──────────────────────────────────────────"
-          echo " 🌐  Starting web UI"
+          echo " 🌐 Starting web UI"
           echo "──────────────────────────────────────────"
           nohup python ollama_server.py > /tmp/webui.log 2>&1 &
           echo $! > /tmp/webui.pid
@@ -1030,7 +1095,7 @@ jobs:
       - name: 🌐 Create tunnel and wait
         run: |
           echo "──────────────────────────────────────────"
-          echo " 🌐  Creating Cloudflare tunnel"
+          echo " 🌐 Creating Cloudflare tunnel"
           echo "──────────────────────────────────────────"
           cloudflared tunnel --url "http://127.0.0.1:${PORT}" --protocol http2 > tunnel.log 2>&1 &
           TUNNEL_PID=$!
@@ -1048,16 +1113,17 @@ jobs:
           fi
           echo ""
           echo "╔═══════════════════════════════════════════════════════════════════╗"
-          echo "║              🎉  Y O U R   S T U D I O   I S   R E A D Y  🎉     ║"
+          echo "║       🎉  Y O U R   M L X   S T U D I O   I S   R E A D Y  🎉    ║"
           echo "╠═══════════════════════════════════════════════════════════════════╣"
           echo "║  🔗  $TUNNEL_URL"
           echo "╚═══════════════════════════════════════════════════════════════════╝"
           {
-            echo "## 🦙 Your LLM Web UI is live"
+            echo "## 🦙 Your LLM & Image Web UI is live"
             echo ""
             echo "**URL:** $TUNNEL_URL"
             echo ""
             echo "**Context:** ${CONTEXT_SIZE} tokens"
+            echo "**Architecture:** Apple Silicon macOS (Native MLX Support)"
             echo ""
             echo "> This link stays live for as long as this job keeps running (up to the 6-hour timeout, or until you cancel the run)."
           } >> "$GITHUB_STEP_SUMMARY"
