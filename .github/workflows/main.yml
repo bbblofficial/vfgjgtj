@@ -1,4 +1,5 @@
 name: 🦙 Local LLM Web Interface (Optimized)
+
 on:
   workflow_dispatch:
     inputs:
@@ -27,6 +28,7 @@ jobs:
     env:
       CONTEXT_SIZE: ${{ inputs.context_size }}
       PORT: ${{ inputs.port }}
+
     steps:
       - name: 🦙 Show banner
         run: |
@@ -79,7 +81,6 @@ jobs:
           sudo systemctl disable ollama 2>/dev/null || true
           nohup ollama serve > /tmp/ollama.log 2>&1 &
           echo $! > /tmp/ollama.pid
-
           echo "⏳ Waiting for Ollama to become ready..."
           ready=false
           for i in $(seq 1 30); do
@@ -96,71 +97,14 @@ jobs:
             exit 1
           fi
 
-      - name: 📥 Download 0.5B to 7B Models
+      - name: 📥 Initialize Model Repository (Not pre-downloaded)
         run: |
           echo "──────────────────────────────────────────"
-          echo " 📥  Downloading All 0.5B to 7B Models"
+          echo " 📥  Skipping pre-downloads; models will be available for on-demand download in the Web UI."
           echo "──────────────────────────────────────────"
-          
-          MODELS=(
-            # --- Qwen Family (General & Code) ---
-            "qwen2.5:0.5b"
-            "qwen2.5:1.5b"
-            "qwen2.5:3b"
-            "qwen2.5:7b"
-            "qwen2.5-coder:0.5b"
-            "qwen2.5-coder:1.5b"
-            "qwen2.5-coder:3b"
-            "qwen2.5-coder:7b"
-            
-            # --- DeepSeek Family ---
-            "deepseek-r1:1.5b"
-            "deepseek-r1:7b"
-            "deepseek-coder:1.3b"
-            "deepseek-coder:6.7b"
-            
-            # --- Llama Family ---
-            "llama3.2:1b"
-            "llama3.2:3b"
-            "tinyllama"
-            
-            # --- Gemma Family ---
-            "gemma2:2b"
-            
-            # --- Phi Family ---
-            "phi3.5"
-            "phi3:mini"
-            
-            # --- Mistral Family ---
-            "mistral:7b"
-            "openhermes"
-            "dolphin-mistral"
-            
-            # --- Small & Fast Alternates ---
-            "smollm:1.7b"
-            "orca-mini:3b"
-            "stablelm2:1.6b"
-          )
-
-          total=${#MODELS[@]}
-          current=0
-          for model in "${MODELS[@]}"; do
-            current=$((current + 1))
-            echo ""
-            echo "──────────────────────────────────────────"
-            echo " [$current/$total] Pulling $model"
-            echo "──────────────────────────────────────────"
-            if ! ollama pull "$model"; then
-              echo "❌ Failed to pull $model (Maybe out of disk space) – skipping to next..."
-            fi
-            echo "  💽 Disk usage now:"
-            df -h / | tail -1
-          done
-          echo ""
-          echo "✅ All pulls attempted. Final model list:"
           ollama list
 
-      - name: 🔧 Write the web server (Glassmorphism UI)
+      - name: 🔧 Write the web server (Glassmorphism UI with On-Demand Model Downloader)
         run: |
           cat > ollama_server.py << 'PYEOF'
           #!/usr/bin/env python3
@@ -185,6 +129,21 @@ jobs:
 
           app = FastAPI(title="Local LLM UI (Optimized)")
 
+          CATALOG_MODELS = [
+              "deepseek-ocr:latest",
+              "it:deepseek-ocr:latest",
+              "flux2-klein:4b",
+              "goonsai/qwen2.5-3b-goonsai-nsfw-100k:latest",
+              "REOinc/REO.AI:latest",
+              "MrTails/Tails-assistant-ai-v3.0.0:latest",
+              "samuser3/granite3.2-gemma3:latest",
+              "samuser3/granite3.2-gemma3:1b",
+              "samuser3/granite3.2-gemma3:4b",
+              "qwen3.8:27b",
+              "parable/fable:3b",
+              "parable/fable:4b"
+          ]
+
           class ChatMessage(BaseModel):
               role: str
               content: str
@@ -194,6 +153,9 @@ jobs:
               model: str
               temperature: Optional[float] = 0.7
               max_tokens: Optional[int] = 2048
+
+          class PullRequest(BaseModel):
+              model: str
 
           @app.get("/api/health")
           async def health():
@@ -228,10 +190,39 @@ jobs:
                       r = await client.get(f"{OLLAMA_HOST}/api/tags")
                       r.raise_for_status()
                       data = r.json()
-                      models = [m["name"] for m in data.get("models", [])]
-                      return {"models": models}
+                      downloaded = [m["name"] for m in data.get("models", [])]
+                      
+                      all_models = list(dict.fromkeys(downloaded + CATALOG_MODELS))
+                      result = []
+                      for m in all_models:
+                          result.append({
+                              "name": m,
+                              "downloaded": m in downloaded
+                          })
+                      return {"models": result}
               except Exception as exc:
                   raise HTTPException(status_code=503, detail=str(exc))
+
+          @app.post("/api/pull")
+          async def pull_model(request: PullRequest):
+              async def generate():
+                  try:
+                      async with httpx.AsyncClient(timeout=None) as client:
+                          async with client.stream(
+                              "POST",
+                              f"{OLLAMA_HOST}/api/pull",
+                              json={"name": request.model, "stream": True},
+                          ) as response:
+                              if response.status_code != 200:
+                                  yield f"data: {json.dumps({'error': 'Failed to start pull'})}\n\n"
+                                  return
+                              async for line in response.aiter_lines():
+                                  if line.strip():
+                                      yield f"data: {line}\n\n"
+                  except Exception as exc:
+                      yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+                  yield "data: [DONE]\n\n"
+              return StreamingResponse(generate(), media_type="text/event-stream")
 
           @app.get("/", response_class=HTMLResponse)
           async def root():
@@ -280,7 +271,6 @@ jobs:
                       logger.exception("chat stream failed")
                       yield f"data: {json.dumps({'error': str(exc)})}\n\n"
                   yield "data: [DONE]\n\n"
-
               return StreamingResponse(generate(), media_type="text/event-stream")
 
           HTML_TEMPLATE = r'''
@@ -329,14 +319,15 @@ jobs:
                                 radial-gradient(circle at 85% 30%, rgba(6, 182, 212, 0.04), transparent 25%);
             }
             .sidebar {
-              width: 290px; background: var(--sidebar); border-right: 1px solid var(--border);
+              width: 310px; background: var(--sidebar); border-right: 1px solid var(--border);
               backdrop-filter: var(--glass); -webkit-backdrop-filter: var(--glass);
               display: flex; flex-direction: column; padding: 20px; flex-shrink: 0; z-index: 10;
+              overflow-y: auto;
             }
             .new-chat-btn {
               display: flex; align-items: center; gap: 10px; width: 100%; padding: 12px 16px;
               background: var(--input-bg); border: 1px solid var(--border); border-radius: 12px; color: var(--text);
-              font-size: 14px; font-weight: 500; cursor: pointer; margin-bottom: 24px;
+              font-size: 14px; font-weight: 500; cursor: pointer; margin-bottom: 20px;
               transition: all 0.2s ease; font-family: inherit;
             }
             .new-chat-btn:hover { border-color: var(--accent); box-shadow: 0 0 15px var(--accent-glow); }
@@ -344,18 +335,35 @@ jobs:
             .settings-group { display: flex; flex-direction: column; gap: 12px; font-size: 13px; color: var(--text-secondary); }
             .settings-group label { display: flex; justify-content: space-between; align-items: center; }
             .settings-group input[type="range"] { width: 100%; accent-color: var(--cyan); margin-top: 4px; }
-            #modelSelect {
-              background: rgba(0,0,0,0.2); color: var(--text); border: 1px solid var(--border);
-              border-radius: 8px; padding: 10px 12px; font-size: 14px; width: 100%; margin-bottom: 16px;
-              font-family: inherit; outline: none; transition: border-color 0.2s;
-            }
-            #modelSelect:focus { border-color: var(--cyan); }
-            #modelSelect option { background: var(--bg); }
             
+            /* Model Manager List */
+            .model-section-title { font-weight: 600; color: var(--text); margin-bottom: 6px; display: flex; justify-content: space-between; align-items: center; }
+            .model-list {
+              background: rgba(0,0,0,0.2); border: 1px solid var(--border); border-radius: 10px;
+              max-height: 200px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; padding: 6px; margin-bottom: 16px;
+            }
+            .model-item {
+              display: flex; align-items: center; justify-content: space-between; padding: 8px 10px;
+              border-radius: 8px; font-size: 12px; cursor: pointer; transition: background 0.2s; border: 1px solid transparent;
+            }
+            .model-item:hover { background: rgba(255,255,255,0.04); }
+            .model-item.active { background: rgba(6, 182, 212, 0.1); border-color: rgba(6, 182, 212, 0.3); }
+            .model-meta { display: flex; flex-direction: column; gap: 2px; overflow: hidden; }
+            .model-name { font-weight: 500; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 150px; }
+            .model-status { font-size: 10px; }
+            .model-status.ready { color: var(--ok); }
+            .model-status.pending { color: var(--text-secondary); }
+            .dl-btn {
+              background: rgba(16, 185, 129, 0.15); border: 1px solid var(--accent); color: var(--accent);
+              padding: 4px 8px; border-radius: 6px; font-size: 11px; cursor: pointer; transition: all 0.2s; flex-shrink: 0;
+            }
+            .dl-btn:hover { background: var(--accent); color: #fff; }
+            .dl-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
             /* System Stats UI */
             .system-stats {
               background: rgba(0,0,0,0.3); border: 1px solid var(--border);
-              border-radius: 12px; padding: 14px; margin-top: 20px;
+              border-radius: 12px; padding: 14px; margin-top: 10px;
               font-size: 12px; display: flex; flex-direction: column; gap: 6px;
             }
             .stat-title { font-weight: 600; color: var(--text); margin-bottom: 2px; display: flex; align-items: center; gap: 6px; }
@@ -364,7 +372,7 @@ jobs:
             #sysSpecs { color: var(--text-secondary); margin-bottom: 8px; line-height: 1.4; }
             .progress-bar { width: 100%; height: 4px; background: rgba(255,255,255,0.1); border-radius: 2px; overflow: hidden; margin-top: 2px; }
             .progress-fill { height: 100%; transition: width 0.3s ease; }
-
+            
             .sidebar-footer {
               margin-top: auto; border-top: 1px solid var(--border); padding-top: 16px;
               font-size: 12px; color: var(--text-secondary); display: flex; flex-direction: column; gap: 10px;
@@ -465,10 +473,15 @@ jobs:
               <button class="new-chat-btn" onclick="clearChat()"><span>＋</span> New Chat</button>
               
               <div class="settings-group">
-                <label style="margin-bottom: 4px; color: var(--text);">Model Selection</label>
-                <select id="modelSelect"></select>
-                
-                <div style="margin-top: 10px;">
+                <div class="model-section-title">
+                  <span>Model Manager</span>
+                  <button onclick="loadModels()" style="background:none; border:none; color:var(--cyan); cursor:pointer; font-size:11px;">🔄 Refresh</button>
+                </div>
+                <div class="model-list" id="modelListContainer">
+                  <div style="padding: 10px; text-align: center; color: var(--text-secondary);">Loading models...</div>
+                </div>
+
+                <div style="margin-top: 6px;">
                   <label>Temperature <span id="tempVal" style="color: var(--cyan);">0.7</span></label>
                   <input type="range" id="temperature" min="0" max="2" step="0.1" value="0.7">
                 </div>
@@ -516,7 +529,6 @@ jobs:
                   </div>
                 </div>
               </div>
-
               <div class="input-area-wrapper">
                 <div class="input-box">
                   <textarea id="userInput" placeholder="Message local model... (Markdown, code, math supported)" rows="1"></textarea>
@@ -528,7 +540,7 @@ jobs:
 
           <script>
             if (window.innerWidth <= 768) { document.querySelector('.menu-btn').style.display = 'flex'; }
-            
+
             marked.setOptions({
               gfm: true, breaks: true,
               highlight: function (code, lang) {
@@ -577,7 +589,7 @@ jobs:
               if (!opts.loading) decorateCodeBlocks(el);
             }
 
-            const STORE_KEY = 'llama-ui-glass-v1';
+            const STORE_KEY = 'llama-ui-glass-v2';
             const chatContainer = document.getElementById('chatContainer');
             const userInput = document.getElementById('userInput');
             const sendButton = document.getElementById('sendButton');
@@ -586,13 +598,12 @@ jobs:
             const statusIndicator = document.getElementById('statusIndicator');
             const temperatureEl = document.getElementById('temperature');
             const maxTokensEl = document.getElementById('maxTokens');
-            const modelSelect = document.getElementById('modelSelect');
+            const modelListContainer = document.getElementById('modelListContainer');
             const currentModelTag = document.getElementById('currentModelTag');
-            
+
             let isStreaming = false, totalTokens = 0, messageHistory = [], controller = null, currentModel = null;
             let statPollInterval;
 
-            // --- Stats & SysInfo Logic ---
             async function fetchSysInfo() {
               try {
                 const r = await fetch('/api/sysinfo');
@@ -602,31 +613,27 @@ jobs:
                 document.getElementById('sysSpecs').innerText = "Unavailable";
               }
             }
-            
+
             async function fetchStats() {
               try {
                 const r = await fetch('/api/stats');
                 const data = await r.json();
-                
                 document.getElementById('cpuVal').textContent = data.cpu_percent.toFixed(1) + '%';
                 document.getElementById('cpuBar').style.width = data.cpu_percent + '%';
-                
                 document.getElementById('ramVal').textContent = data.ram_percent.toFixed(1) + '%';
                 document.getElementById('ramBar').style.width = data.ram_percent + '%';
                 document.getElementById('ramUsedText').textContent = data.ram_used + ' Used';
               } catch (e) {}
             }
-            
-            // Poll slowly when idle, fast when generating
+
             function setPolling(fast) {
               clearInterval(statPollInterval);
-              fetchStats(); // call immediately
+              fetchStats();
               statPollInterval = setInterval(fetchStats, fast ? 1000 : 3000);
             }
-            
+
             fetchSysInfo();
             setPolling(false);
-            // -----------------------------
 
             async function loadModels() {
               try {
@@ -634,25 +641,94 @@ jobs:
                 if (!resp.ok) throw new Error('Failed to fetch models');
                 const data = await resp.json();
                 const models = data.models || [];
+                
                 if (models.length === 0) {
-                  modelSelect.innerHTML = '<option value="">No models found</option>'; return;
+                  modelListContainer.innerHTML = '<div style="padding: 10px; text-align: center; color: var(--text-secondary);">No models found</div>';
+                  return;
                 }
-                modelSelect.innerHTML = models.map(m => `<option value="${m}">${m}</option>`).join('');
-                modelSelect.value = models[0];
-                currentModel = models[0];
-                updateModelTag();
+
+                modelListContainer.innerHTML = models.map(m => `
+                  <div class="model-item ${m.name === currentModel ? 'active' : ''}" onclick="${m.downloaded ? `selectModel('${m.name}')` : ''}">
+                    <div class="model-meta">
+                      <span class="model-name" title="${m.name}">${m.name}</span>
+                      <span class="model-status ${m.downloaded ? 'ready' : 'pending'}">${m.downloaded ? '🟢 Ready' : '📥 Not Downloaded'}</span>
+                    </div>
+                    ${!m.downloaded ? `<button class="dl-btn" onclick="downloadModel('${m.name}', event)">Download</button>` : ''}
+                  </div>
+                `).join('');
+
+                const downloaded = models.filter(m => m.downloaded);
+                if (!currentModel && downloaded.length > 0) {
+                  currentModel = downloaded[0].name;
+                  updateModelTag();
+                } else if (currentModel && !downloaded.some(m => m.name === currentModel) && downloaded.length > 0) {
+                  currentModel = downloaded[0].name;
+                  updateModelTag();
+                }
               } catch (e) {
-                modelSelect.innerHTML = '<option value="">Error loading models</option>';
+                modelListContainer.innerHTML = '<div style="padding: 10px; text-align: center; color: var(--danger);">Error loading models</div>';
+              }
+            }
+
+            function selectModel(modelName) {
+              currentModel = modelName;
+              updateModelTag();
+              saveState();
+              loadModels();
+            }
+
+            async function downloadModel(modelName, event) {
+              event.stopPropagation();
+              const btn = event.target;
+              btn.disabled = true;
+              btn.textContent = 'Pulling...';
+
+              try {
+                const resp = await fetch('/api/pull', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ model: modelName })
+                });
+                if (!resp.ok) throw new Error('Download failed');
+                
+                const reader = resp.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+
+                while (true) {
+                  const { done, value } = await reader.read();
+                  if (done) break;
+                  buffer += decoder.decode(value, { stream: true });
+                  const lines = buffer.split('\n');
+                  buffer = lines.pop() || '';
+                  
+                  for (const line of lines) {
+                    if (!line.startsWith('data: ')) continue;
+                    const data = line.slice(6);
+                    if (data === '[DONE]') continue;
+                    try {
+                      const parsed = JSON.parse(data);
+                      if (parsed.status) {
+                        if (parsed.completed && parsed.total) {
+                          const pct = Math.round((parsed.completed / parsed.total) * 100);
+                          btn.textContent = `${pct}%`;
+                        } else {
+                          btn.textContent = parsed.status;
+                        }
+                      }
+                    } catch (err) {}
+                  }
+                }
+                loadModels();
+              } catch (e) {
+                btn.textContent = 'Failed';
+                btn.disabled = false;
               }
             }
 
             function updateModelTag() {
               currentModelTag.textContent = currentModel ? '📦 ' + currentModel : '📦 (no model)';
             }
-
-            modelSelect.addEventListener('change', function() {
-              currentModel = this.value; updateModelTag(); saveState();
-            });
 
             function saveState() {
               try {
@@ -670,13 +746,7 @@ jobs:
                 const s = JSON.parse(raw);
                 if (s.temperature) { temperatureEl.value = s.temperature; document.getElementById('tempVal').textContent = s.temperature; }
                 if (s.maxTokens) { maxTokensEl.value = s.maxTokens; document.getElementById('tokenVal').textContent = s.maxTokens; }
-                if (s.model) {
-                  setTimeout(() => {
-                    if (modelSelect.querySelector(`option[value="${s.model}"]`)) {
-                      modelSelect.value = s.model; currentModel = s.model; updateModelTag();
-                    }
-                  }, 100);
-                }
+                if (s.model) { currentModel = s.model; updateModelTag(); }
                 if (Array.isArray(s.messageHistory)) {
                   messageHistory = s.messageHistory; totalTokens = s.totalTokens || 0;
                   messageHistory.forEach(m => appendMessage(m.role, m.content));
@@ -691,6 +761,7 @@ jobs:
                 statusIndicator.innerHTML = r.ok ? '<span class="status-dot ok"></span>Connected to Ollama' : '<span class="status-dot bad"></span>Ollama unreachable';
               } catch { statusIndicator.innerHTML = '<span class="status-dot bad"></span>Ollama unreachable'; }
             }
+
             checkHealth(); setInterval(checkHealth, 15000);
 
             userInput.addEventListener('input', function () {
@@ -699,6 +770,7 @@ jobs:
             userInput.addEventListener('keydown', function (e) {
               if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
             });
+
             temperatureEl.addEventListener('input', function () { document.getElementById('tempVal').textContent = this.value; saveState(); });
             maxTokensEl.addEventListener('input', function () { document.getElementById('tokenVal').textContent = this.value; saveState(); });
 
@@ -737,18 +809,17 @@ jobs:
               if (isStreaming) return;
               const text = userInput.value.trim();
               if (!text) return;
-              if (!currentModel) return alert('Please select a model first.');
-              
+              if (!currentModel) return alert('Please select a downloaded model first.');
+
               appendMessage('user', text);
               messageHistory.push({ role: 'user', content: text });
               userInput.value = ''; userInput.style.height = 'auto';
               sendButton.style.display = 'none'; stopButton.style.display = 'flex';
               isStreaming = true; controller = new AbortController();
               appendMessage('assistant', 'Processing', true);
-              
-              // Poll fast while generating
+
               setPolling(true);
-              
+
               let fullContent = '';
               try {
                 const response = await fetch('/api/chat', {
@@ -758,12 +829,12 @@ jobs:
                     temperature: parseFloat(temperatureEl.value), max_tokens: parseInt(maxTokensEl.value)
                   })
                 });
-                
+
                 if (!response.ok) throw new Error(`Server returned ${response.status}`);
                 const reader = response.body.getReader();
                 const decoder = new TextDecoder();
                 let buffer = '', streamError = null;
-                
+
                 while (true) {
                   const { done, value } = await reader.read();
                   if (done) break;
@@ -784,7 +855,7 @@ jobs:
                     } catch { }
                   }
                 }
-                
+
                 if (streamError) throw new Error(streamError);
                 updateLastAssistantMessage(fullContent, true);
                 messageHistory.push({ role: 'assistant', content: fullContent });
@@ -799,27 +870,22 @@ jobs:
                   updateLastAssistantMessage(`⚠️ ${error.message || 'Error generating response.'}`, true);
                 }
               }
-              
+
               sendButton.style.display = 'flex'; stopButton.style.display = 'none';
               isStreaming = false; controller = null; userInput.focus();
-              
-              // Revert to slow polling
               setPolling(false);
             }
 
             loadModels().then(() => {
               restoreState();
-              if (!currentModel && modelSelect.options.length > 0) {
-                currentModel = modelSelect.value; updateModelTag();
-              }
               const welcome = document.getElementById('welcomeMsg');
-              renderInto(welcome, `System ready. The active model is **${currentModel || 'loading'}**. Code, math, and tables are fully supported in this glassmorphic environment.`);
+              renderInto(welcome, `System ready. Select or download a model from the **Model Manager** to begin. Code, math, and tables are fully supported.`);
             });
           </script>
           </body>
           </html>
           '''
-          
+
           if __name__ == "__main__":
               uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
           PYEOF
@@ -832,7 +898,6 @@ jobs:
           echo "──────────────────────────────────────────"
           nohup python ollama_server.py > /tmp/webui.log 2>&1 &
           echo $! > /tmp/webui.pid
-
           ready=false
           for i in $(seq 1 15); do
             if curl -sf "http://localhost:${PORT}" > /dev/null 2>&1; then
@@ -862,7 +927,6 @@ jobs:
           echo "──────────────────────────────────────────"
           cloudflared tunnel --url "http://127.0.0.1:${PORT}" --protocol http2 > tunnel.log 2>&1 &
           TUNNEL_PID=$!
-
           echo "⏳ Waiting for tunnel URL..."
           TUNNEL_URL=""
           for i in $(seq 1 30); do
@@ -870,31 +934,27 @@ jobs:
             [ -n "$TUNNEL_URL" ] && break
             sleep 2
           done
-
           if [ -z "$TUNNEL_URL" ]; then
             echo "❌ Could not get a tunnel URL. Tunnel log:"
             cat tunnel.log
             exit 1
           fi
-
           echo ""
           echo "╔═══════════════════════════════════════════════════════════════════╗"
           echo "║              🎉  Y O U R   L L M   I S   R E A D Y  🎉            ║"
           echo "╠═══════════════════════════════════════════════════════════════════╣"
           echo "║  🔗  $TUNNEL_URL"
           echo "╚═══════════════════════════════════════════════════════════════════╝"
-
           {
             echo "## 🦙 Your LLM web UI is live"
             echo ""
             echo "**URL:** $TUNNEL_URL"
             echo ""
-            echo "**Models downloaded:** 24+ Models (0.5B to 7B)"
             echo "**Context:** ${CONTEXT_SIZE} tokens"
+            echo "**Model Manager:** On-demand download enabled for all models."
             echo ""
             echo "> This link stays live for as long as this job keeps running (up to the 6-hour timeout, or until you cancel the run)."
           } >> "$GITHUB_STEP_SUMMARY"
-
           wait "$TUNNEL_PID"
 
       - name: 🧹 Cleanup
