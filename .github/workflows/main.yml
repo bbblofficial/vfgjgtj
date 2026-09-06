@@ -54,14 +54,12 @@ jobs:
           echo "──────────────────────────────────────────"
           echo " 📦  Installing Official Ollama App + MLX"
           echo "──────────────────────────────────────────"
-          # دانلود بسته رسمی و مستقیم Ollama مخصوص macOS از گیت‌هاب
           curl -fsSL https://github.com/ollama/ollama/releases/latest/download/Ollama-darwin.zip -o /tmp/Ollama-darwin.zip
           unzip -q /tmp/Ollama-darwin.zip -d /tmp/ollama_app
           sudo cp /tmp/ollama_app/Ollama.app/Contents/Resources/ollama /usr/local/bin/ollama
           sudo chmod +x /usr/local/bin/ollama
           rm -rf /tmp/Ollama-darwin.zip /tmp/ollama_app
 
-          # نصب پکیج‌های پایتون و MLX
           pip install --no-cache-dir \
             fastapi uvicorn aiohttp httpx python-multipart \
             jinja2 websockets pydantic psutil mlx
@@ -1082,9 +1080,12 @@ jobs:
 
       - name: 📦 Install cloudflared (macOS Darwin)
         run: |
-          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64 -o /tmp/cloudflared
-          chmod +x /tmp/cloudflared
+          # دانلود بسته فشرده رسمی macOS ARM64 و اکسترکت مستقیم باینری
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz -o /tmp/cloudflared.tgz
+          tar -xzf /tmp/cloudflared.tgz -C /tmp
           sudo mv /tmp/cloudflared /usr/local/bin/cloudflared
+          sudo chmod +x /usr/local/bin/cloudflared
+          rm -f /tmp/cloudflared.tgz
           cloudflared --version
 
       - name: 🌐 Create tunnel and wait
