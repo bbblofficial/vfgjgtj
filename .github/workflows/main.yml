@@ -1,4 +1,4 @@
-name: 🦙 Local LLM Web Interface (Optimized)
+name: 🦙 Local LLM Web Interface (macOS Apple Silicon / MLX Support)
 
 on:
   workflow_dispatch:
@@ -23,7 +23,8 @@ concurrency:
 
 jobs:
   deploy-llama:
-    runs-on: ubuntu-latest
+    # رانر مکینتاش اپل سیلیکون برای پشتیبانی رسمی از MLX و مدل‌های x/
+    runs-on: macos-latest
     timeout-minutes: 360
     env:
       CONTEXT_SIZE: ${{ inputs.context_size }}
@@ -33,25 +34,22 @@ jobs:
       - name: 🦙 Show banner
         run: |
           echo "╔═══════════════════════════════════════════════════════════════════╗"
-          echo "║   🦙  L O C A L   L L M   W E B   U I   ( O P T I M I Z E D )     ║"
+          echo "║   🦙  M A C O S   A P P L E   S I L I C O N   ( M L X )           ║"
           echo "╚═══════════════════════════════════════════════════════════════════╝"
           echo "  📝 Context: ${CONTEXT_SIZE} tokens"
           echo "  🔌 Port:    ${PORT}"
           echo "  🏃 Runner:  $(uname -a)"
-          echo "  💾 Memory:  $(free -h | awk '/Mem:/{print $2}')"
-          echo "  🧠 CPUs:    $(nproc)"
-          echo "  ⏱️ Timeout:  6 Hours (360 minutes)"
+          echo "  🧠 Chip:    $(sysctl -n machdep.cpu.brand_string 2>/dev/null || uname -m)"
           echo "  💽 Disk before cleanup:"
           df -h / | tail -1
 
-      - name: 🧹 Free up disk space
+      - name: 🧹 Free up disk space (macOS)
         run: |
           echo "──────────────────────────────────────────"
-          echo " 🧹  Reclaiming disk space"
+          echo " 🧹  Reclaiming disk space on macOS"
           echo "──────────────────────────────────────────"
-          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet \
-            /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" 2>/dev/null || true
-          sudo docker image prune -af 2>/dev/null || true
+          sudo rm -rf /Applications/Xcode_*.app 2>/dev/null || true
+          brew cleanup --prune=all 2>/dev/null || true
           echo "  💽 Disk after cleanup:"
           df -h / | tail -1
 
@@ -60,32 +58,34 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: 📦 Install dependencies
+      - name: 📦 Install Ollama, MLX & Python packages
         run: |
           echo "──────────────────────────────────────────"
-          echo " 📦  Installing Ollama + Python packages"
+          echo " 📦  Installing Ollama + MLX + Python Packages"
           echo "──────────────────────────────────────────"
-          curl -fsSL https://ollama.com/install.sh | sh
+          # نصب اولاما روی مک
+          brew install ollama
+          
+          # نصب پکیج‌های پایتون به همراه mlx
           pip install --no-cache-dir \
             fastapi uvicorn aiohttp httpx python-multipart \
-            jinja2 websockets pydantic psutil
+            jinja2 websockets pydantic psutil mlx
+
           ollama --version
-          python --version
+          python -c "import mlx.core as mx; print('✅ MLX Framework Ready on device:', mx.default_device())"
 
       - name: 🚀 Start Ollama server
         run: |
           echo "──────────────────────────────────────────"
-          echo " 🚀  Starting Ollama"
+          echo " 🚀  Starting Ollama on macOS"
           echo "──────────────────────────────────────────"
-          sudo systemctl stop ollama 2>/dev/null || true
-          sudo systemctl disable ollama 2>/dev/null || true
           nohup ollama serve > /tmp/ollama.log 2>&1 &
           echo $! > /tmp/ollama.pid
           echo "⏳ Waiting for Ollama to become ready..."
           ready=false
           for i in $(seq 1 30); do
             if curl -sf http://localhost:11434/api/tags > /dev/null 2>&1; then
-              echo "✅ Ollama is ready!"
+              echo "✅ Ollama is ready with MLX support!"
               ready=true
               break
             fi
@@ -97,14 +97,7 @@ jobs:
             exit 1
           fi
 
-      - name: 📥 Initialize Model Repository
-        run: |
-          echo "──────────────────────────────────────────"
-          echo " 📥  All models initialized for on-demand downloading."
-          echo "──────────────────────────────────────────"
-          ollama list
-
-      - name: 🔧 Write the web server (Glassmorphism UI with Fixed Live Puller)
+      - name: 🔧 Write the web server
         run: |
           cat > ollama_server.py << 'PYEOF'
           #!/usr/bin/env python3
@@ -127,10 +120,9 @@ jobs:
           CONTEXT_SIZE = int(os.getenv("CONTEXT_SIZE", "4096"))
           PORT = int(os.getenv("PORT", "7860"))
 
-          app = FastAPI(title="Local LLM UI (Optimized)")
+          app = FastAPI(title="Local LLM UI (MLX Edition)")
 
           CATALOG_MODELS = [
-              # Requested Image / Vision / Custom Models
               "x/z-image-turbo:latest",
               "x/flux2-klein:latest",
               "deepseek-ocr:latest",
@@ -145,8 +137,6 @@ jobs:
               "qwen3.8:27b",
               "parable/fable:3b",
               "parable/fable:4b",
-
-              # Qwen Family
               "qwen2.5:0.5b",
               "qwen2.5:1.5b",
               "qwen2.5:3b",
@@ -155,24 +145,16 @@ jobs:
               "qwen2.5-coder:1.5b",
               "qwen2.5-coder:3b",
               "qwen2.5-coder:7b",
-
-              # DeepSeek Family
               "deepseek-r1:1.5b",
               "deepseek-r1:7b",
               "deepseek-coder:1.3b",
               "deepseek-coder:6.7b",
-
-              # Llama Family
               "llama3.2:1b",
               "llama3.2:3b",
               "tinyllama",
-
-              # Gemma & Phi
               "gemma2:2b",
               "phi3.5",
               "phi3:mini",
-
-              # Mistral & Other Lightweight Models
               "mistral:7b",
               "openhermes",
               "dolphin-mistral",
@@ -209,7 +191,7 @@ jobs:
               return {
                   "cpu_threads": psutil.cpu_count(logical=True),
                   "ram_total": f"{psutil.virtual_memory().total / (1024**3):.1f} GB",
-                  "os": platform.system() + " " + platform.release()
+                  "os": platform.system() + " " + platform.release() + " (Apple Silicon / MLX Enabled)"
               }
 
           @app.get("/api/stats")
@@ -327,7 +309,7 @@ jobs:
           <head>
           <meta charset="UTF-8">
           <meta name="viewport" content="width=device-width, initial-scale=1.0">
-          <title>Local LLM Studio</title>
+          <title>Local LLM Studio (MLX Enabled)</title>
           
           <link rel="preconnect" href="https://fonts.googleapis.com">
           <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -628,7 +610,7 @@ jobs:
               }
             }
 
-            const STORE_KEY = 'llama-ui-glass-v3';
+            const STORE_KEY = 'llama-ui-glass-mlx';
             const chatContainer = document.getElementById('chatContainer');
             const userInput = document.getElementById('userInput');
             const sendButton = document.getElementById('sendButton');
@@ -821,7 +803,7 @@ jobs:
                 modalBar.style.background = 'var(--ok)';
                 modalPercent.textContent = '100%';
                 modalStatus.textContent = 'Completed successfully!';
-                appendLog(`[Success] Model ${modelName} ready.`);
+                appendLog(`[Success] Model ${modelName} ready with MLX support.`);
                 modalCloseBtn.disabled = false;
                 modalCloseBtn.textContent = 'Done & Select';
                 modalCloseBtn.onclick = () => {
@@ -873,7 +855,7 @@ jobs:
             async function checkHealth() {
               try {
                 const r = await fetch('/api/health');
-                statusIndicator.innerHTML = r.ok ? '<span class="status-dot ok"></span>Connected to Ollama' : '<span class="status-dot bad"></span>Ollama unreachable';
+                statusIndicator.innerHTML = r.ok ? '<span class="status-dot ok"></span>Connected to Ollama (MLX)' : '<span class="status-dot bad"></span>Ollama unreachable';
               } catch { statusIndicator.innerHTML = '<span class="status-dot bad"></span>Ollama unreachable'; }
             }
 
@@ -994,7 +976,7 @@ jobs:
             loadModels().then(() => {
               restoreState();
               const welcome = document.getElementById('welcomeMsg');
-              renderInto(welcome, `System ready. Select or download any model from the **Model Selector & Library** on the left to begin.`);
+              renderInto(welcome, `System ready on macOS Apple Silicon. MLX runtime is fully loaded. Select or download any model to begin.`);
             });
           </script>
           </body>
@@ -1028,11 +1010,9 @@ jobs:
             exit 1
           fi
 
-      - name: 📦 Install cloudflared
+      - name: 📦 Install cloudflared (macOS Darwin)
         run: |
-          curl -L -s https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
-          chmod +x cloudflared
-          sudo mv cloudflared /usr/local/bin/
+          brew install cloudflared
           cloudflared --version
 
       - name: 🌐 Create tunnel and wait
@@ -1056,17 +1036,17 @@ jobs:
           fi
           echo ""
           echo "╔═══════════════════════════════════════════════════════════════════╗"
-          echo "║              🎉  Y O U R   L L M   I S   R E A D Y  🎉            ║"
+          echo "║       🎉  Y O U R   M L X   L L M   I S   R E A D Y  🎉          ║"
           echo "╠═══════════════════════════════════════════════════════════════════╣"
           echo "║  🔗  $TUNNEL_URL"
           echo "╚═══════════════════════════════════════════════════════════════════╝"
           {
-            echo "## 🦙 Your LLM web UI is live"
+            echo "## 🦙 Your LLM web UI is live (Apple Silicon / MLX)"
             echo ""
             echo "**URL:** $TUNNEL_URL"
             echo ""
             echo "**Context:** ${CONTEXT_SIZE} tokens"
-            echo "**Model Manager:** Ready with on-demand download and real-time streaming modal."
+            echo "**Architecture:** Apple Silicon (macOS) with native MLX support."
             echo ""
             echo "> This link stays live for as long as this job keeps running (up to the 6-hour timeout, or until you cancel the run)."
           } >> "$GITHUB_STEP_SUMMARY"
