@@ -40,10 +40,8 @@ jobs:
           echo "  💾 Memory:  $(free -h | awk '/Mem:/{print $2}')"
           echo "  🧠 CPUs:    $(nproc)"
           echo "  ⏱️ Timeout:  6 Hours (360 minutes)"
-          echo "  💽 Disk before cleanup:"
+          echo "  💽 Disk space:"
           df -h / | tail -1
-
-
 
       - name: 🐍 Setup Python
         uses: actions/setup-python@v5
@@ -89,8 +87,8 @@ jobs:
 
       - name: 🔧 Write the web server (Glassmorphism UI)
         run: |
-          cat > ollama_server.py << 'PYEOF'
-          #!/usr/bin/env python3
+          python3 - << 'EOF'
+          server_code = r'''#!/usr/bin/env python3
           import json
           import os
           import logging
@@ -113,7 +111,6 @@ jobs:
 
           app = FastAPI(title="Local LLM UI (Optimized)")
 
-          # Curated catalog of models available for on-demand pull
           CATALOG_MODELS = [
               {"name": "qwen2.5:0.5b", "type": "general"},
               {"name": "qwen2.5:1.5b", "type": "general"},
@@ -1075,8 +1072,12 @@ jobs:
           </script>
           </body>
           </html>
-          PYEOF
-          echo "✅ Server script written"
+          '''
+
+          with open('ollama_server.py', 'w', encoding='utf-8') as f:
+              f.write(server_code)
+          print("✅ Server script written safely")
+          EOF
 
       - name: 🌐 Start web server
         run: |
