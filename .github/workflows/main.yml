@@ -28,6 +28,7 @@ jobs:
     env:
       CONTEXT_SIZE: ${{ inputs.context_size }}
       PORT: ${{ inputs.port }}
+      OLLAMA_MODELS: /Users/runner/ollama_models
 
     steps:
       - name: 🦙 Show banner
@@ -42,14 +43,22 @@ jobs:
           echo "  💽 Disk before cleanup:"
           df -h / | tail -1
 
-      - name: 🧹 Free up disk space (macOS)
+      - name: 🧹 Deep disk cleanup (Aggressive space reclaim)
         run: |
           echo "──────────────────────────────────────────"
-          echo " 🧹  Reclaiming disk space on macOS"
+          echo " 🧹  Purging heavy SDKs, caches, and runtimes"
           echo "──────────────────────────────────────────"
-          sudo rm -rf /Applications/Xcode_*.app 2>/dev/null || true
+          # Remove massive pre-installed toolchains on macOS runners
+          sudo rm -rf /Applications/Xcode*.app 2>/dev/null || true
+          sudo rm -rf /Library/Developer/CoreSimulator 2>/dev/null || true
+          sudo rm -rf /Users/runner/Library/Android 2>/dev/null || true
+          sudo rm -rf /usr/local/share/dotnet 2>/dev/null || true
+          sudo rm -rf /Library/Frameworks/Mono.framework 2>/dev/null || true
+          sudo rm -rf /Users/runner/Library/Caches/* 2>/dev/null || true
           brew cleanup --prune=all 2>/dev/null || true
-          echo "  💽 Disk after cleanup:"
+          
+          mkdir -p /Users/runner/ollama_models
+          echo "  💽 Available disk space after purge:"
           df -h / | tail -1
 
       - name: 🐍 Setup Python
@@ -60,7 +69,7 @@ jobs:
       - name: 📦 Install Ollama, MLX & Python packages
         run: |
           echo "──────────────────────────────────────────"
-          echo " 📦  Installing Ollama + MLX + Python Packages"
+          echo " 📦  Installing Ollama + MLX + Dependencies"
           echo "──────────────────────────────────────────"
           brew install ollama
           pip install --no-cache-dir \
@@ -75,28 +84,34 @@ jobs:
           echo "──────────────────────────────────────────"
           echo " 🚀  Starting Ollama on macOS"
           echo "──────────────────────────────────────────"
+          export OLLAMA_MODELS="/Users/runner/ollama_models"
+          export OLLAMA_HOST="0.0.0.0:11434"
+          export OLLAMA_KEEP_ALIVE="24h"
+          
           nohup ollama serve > /tmp/ollama.log 2>&1 &
           echo $! > /tmp/ollama.pid
-          echo "⏳ Waiting for Ollama to become ready..."
+          
+          echo "⏳ Waiting for Ollama engine to report healthy..."
           ready=false
           for i in $(seq 1 30); do
             if curl -sf http://localhost:11434/api/tags > /dev/null 2>&1; then
-              echo "✅ Ollama is ready with MLX support!"
+              echo "✅ Ollama is live with dedicated models directory!"
               ready=true
               break
             fi
             sleep 2
           done
+          
           if [ "$ready" != "true" ]; then
             echo "❌ Ollama failed to start. Last logs:"
             tail -n 50 /tmp/ollama.log || true
             exit 1
           fi
 
-      - name: 📥 Initialize Model Repository
+      - name: 📥 Verify Repository state
         run: |
           echo "──────────────────────────────────────────"
-          echo " 📥  All models initialized for on-demand downloading."
+          echo " 📥  Ready for selective on-demand streaming"
           echo "──────────────────────────────────────────"
           ollama list
 
@@ -119,7 +134,7 @@ jobs:
           logging.basicConfig(level=logging.INFO)
           logger = logging.getLogger("studio-ui")
 
-          OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+          OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
           CONTEXT_SIZE = int(os.getenv("CONTEXT_SIZE", "4096"))
           PORT = int(os.getenv("PORT", "7860"))
 
@@ -135,7 +150,7 @@ jobs:
               "deepseek-ocr:latest",
               "it:deepseek-ocr:latest",
 
-              # Community & Fine-tuned
+              # Fine-tuned & Specialized
               "goonsai/qwen2.5-3b-goonsai-nsfw-100k:latest",
               "REOinc/REO.AI:latest",
               "MrTails/Tails-assistant-ai-v3.0.0:latest",
@@ -146,7 +161,7 @@ jobs:
               "parable/fable:3b",
               "parable/fable:4b",
 
-              # General LLMs (Qwen, DeepSeek, Llama, etc.)
+              # Conversational & Coding
               "qwen2.5:0.5b",
               "qwen2.5:1.5b",
               "qwen2.5:3b",
@@ -212,10 +227,12 @@ jobs:
 
           @app.get("/api/stats")
           def stats():
+              disk = psutil.disk_usage('/')
               return {
                   "cpu_percent": psutil.cpu_percent(interval=None),
                   "ram_percent": psutil.virtual_memory().percent,
-                  "ram_used": f"{psutil.virtual_memory().used / (1024**3):.1f} GB"
+                  "ram_used": f"{psutil.virtual_memory().used / (1024**3):.1f} GB",
+                  "disk_free": f"{disk.free / (1024**3):.1f} GB"
               }
 
           @app.get("/api/models")
@@ -250,7 +267,8 @@ jobs:
           async def pull_model(request: PullRequest):
               async def generate():
                   try:
-                      timeout = httpx.Timeout(connect=60.0, read=None, write=60.0, pool=None)
+                      # Extended timeout for large weights downloads
+                      timeout = httpx.Timeout(connect=120.0, read=None, write=120.0, pool=None)
                       async with httpx.AsyncClient(timeout=timeout) as client:
                           async with client.stream(
                               "POST",
@@ -266,7 +284,7 @@ jobs:
                                   if line:
                                       yield f"data: {line}\n\n"
                   except Exception as exc:
-                      logger.exception("pull stream error")
+                      logger.exception("pull streaming failed")
                       yield f"data: {json.dumps({'error': str(exc)})}\n\n"
                   yield "data: [DONE]\n\n"
               return StreamingResponse(generate(), media_type="text/event-stream")
@@ -279,42 +297,42 @@ jobs:
           async def chat(request: ChatRequest):
               async def generate():
                   try:
-                      # If it's an image model, forward prompt to /api/generate
+                      # Auto-route image diffusion models
                       if is_image_model(request.model):
                           prompt = request.messages[-1].content if request.messages else ""
-                          async with httpx.AsyncClient(timeout=300) as client:
-                              async with client.stream(
-                                  "POST",
+                          timeout = httpx.Timeout(connect=60.0, read=600.0, write=60.0, pool=None)
+                          async with httpx.AsyncClient(timeout=timeout) as client:
+                              res = await client.post(
                                   f"{OLLAMA_HOST}/api/generate",
                                   json={
                                       "model": request.model,
                                       "prompt": prompt,
                                       "stream": False
                                   },
-                              ) as response:
-                                  if response.status_code != 200:
-                                      body = await response.aread()
-                                      yield f"data: {json.dumps({'error': body.decode(errors='ignore')})}\n\n"
-                                      yield "data: [DONE]\n\n"
-                                      return
-                                  res_data = await response.json()
-                                  if err := res_data.get("error"):
-                                      yield f"data: {json.dumps({'error': err})}\n\n"
-                                  elif "response" in res_data:
-                                      # Check if Ollama returned image base64 data
-                                      content = res_data["response"]
-                                      yield f"data: {json.dumps({'content': content})}\n\n"
-                                  elif "image" in res_data:
-                                      img_tag = f"![Generated Image](data:image/png;base64,{res_data['image']})"
-                                      yield f"data: {json.dumps({'content': img_tag})}\n\n"
-                                  else:
-                                      yield f"data: {json.dumps({'content': str(res_data)})}\n\n"
+                              )
+                              if res.status_code != 200:
+                                  yield f"data: {json.dumps({'error': res.text})}\n\n"
                                   yield "data: [DONE]\n\n"
                                   return
+                              
+                              res_data = res.json()
+                              if err := res_data.get("error"):
+                                  yield f"data: {json.dumps({'error': err})}\n\n"
+                              elif "image" in res_data:
+                                  img_tag = f"![Generated Image](data:image/png;base64,{res_data['image']})"
+                                  yield f"data: {json.dumps({'content': img_tag})}\n\n"
+                              elif "response" in res_data:
+                                  content = res_data["response"]
+                                  yield f"data: {json.dumps({'content': content})}\n\n"
+                              else:
+                                  yield f"data: {json.dumps({'content': json.dumps(res_data, indent=2)})}\n\n"
+                                  
+                              yield "data: [DONE]\n\n"
+                              return
 
-                      # Standard LLM Chat Handling
+                      # Standard conversational LLM processing
                       ollama_messages = [{"role": m.role, "content": m.content} for m in request.messages]
-                      async with httpx.AsyncClient(timeout=180) as client:
+                      async with httpx.AsyncClient(timeout=300) as client:
                           async with client.stream(
                               "POST",
                               f"{OLLAMA_HOST}/api/chat",
@@ -349,7 +367,7 @@ jobs:
                                   if content:
                                       yield f"data: {json.dumps({'content': content})}\n\n"
                   except Exception as exc:
-                      logger.exception("inference execution failed")
+                      logger.exception("execution error")
                       yield f"data: {json.dumps({'error': str(exc)})}\n\n"
                   yield "data: [DONE]\n\n"
               return StreamingResponse(generate(), media_type="text/event-stream")
@@ -613,6 +631,11 @@ jobs:
                   <span id="ramVal" class="stat-value" style="color: var(--accent);">0%</span>
                 </div>
                 <div class="progress-bar"><div id="ramBar" class="progress-fill" style="background: var(--accent); width: 0%;"></div></div>
+                
+                <div class="stat-row" style="margin-top: 6px;">
+                  <span>Disk Free:</span>
+                  <span id="diskFreeVal" class="stat-value" style="color: var(--ok);">0 GB</span>
+                </div>
                 <div id="ramUsedText" style="text-align: right; font-size: 10px; color: var(--text-secondary); margin-top: 2px;">0 GB Used</div>
               </div>
 
@@ -707,6 +730,7 @@ jobs:
                 document.getElementById('cpuBar').style.width = data.cpu_percent + '%';
                 document.getElementById('ramVal').textContent = data.ram_percent.toFixed(1) + '%';
                 document.getElementById('ramBar').style.width = data.ram_percent + '%';
+                document.getElementById('diskFreeVal').textContent = data.disk_free;
                 document.getElementById('ramUsedText').textContent = data.ram_used + ' Used';
               } catch (e) {}
             }
@@ -1105,7 +1129,7 @@ jobs:
             echo "**URL:** $TUNNEL_URL"
             echo ""
             echo "**Context:** ${CONTEXT_SIZE} tokens"
-            echo "**Runner:** Apple Silicon macOS (Native MLX Support)"
+            echo "**Architecture:** Apple Silicon macOS (Native MLX Support)"
             echo ""
             echo "> This link stays live for as long as this job keeps running (up to the 6-hour timeout, or until you cancel the run)."
           } >> "$GITHUB_STEP_SUMMARY"
