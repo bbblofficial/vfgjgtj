@@ -1,4 +1,4 @@
-name: 🦙 Local LLM Web Interface (macOS Apple Silicon / MLX Support)
+name: 🦙 Local LLM & Image Studio (macOS Apple Silicon / MLX)
 
 on:
   workflow_dispatch:
@@ -23,7 +23,6 @@ concurrency:
 
 jobs:
   deploy-llama:
-    # رانر مکینتاش اپل سیلیکون برای پشتیبانی رسمی از MLX و مدل‌های x/
     runs-on: macos-latest
     timeout-minutes: 360
     env:
@@ -63,10 +62,7 @@ jobs:
           echo "──────────────────────────────────────────"
           echo " 📦  Installing Ollama + MLX + Python Packages"
           echo "──────────────────────────────────────────"
-          # نصب اولاما روی مک
           brew install ollama
-          
-          # نصب پکیج‌های پایتون به همراه mlx
           pip install --no-cache-dir \
             fastapi uvicorn aiohttp httpx python-multipart \
             jinja2 websockets pydantic psutil mlx
@@ -97,7 +93,14 @@ jobs:
             exit 1
           fi
 
-      - name: 🔧 Write the web server
+      - name: 📥 Initialize Model Repository
+        run: |
+          echo "──────────────────────────────────────────"
+          echo " 📥  All models initialized for on-demand downloading."
+          echo "──────────────────────────────────────────"
+          ollama list
+
+      - name: 🔧 Write the web server (Hybrid LLM & Image Generation Studio)
         run: |
           cat > ollama_server.py << 'PYEOF'
           #!/usr/bin/env python3
@@ -114,20 +117,25 @@ jobs:
           from pydantic import BaseModel
 
           logging.basicConfig(level=logging.INFO)
-          logger = logging.getLogger("llama-ui")
+          logger = logging.getLogger("studio-ui")
 
           OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
           CONTEXT_SIZE = int(os.getenv("CONTEXT_SIZE", "4096"))
           PORT = int(os.getenv("PORT", "7860"))
 
-          app = FastAPI(title="Local LLM UI (MLX Edition)")
+          app = FastAPI(title="Local Studio (MLX Hybrid)")
 
           CATALOG_MODELS = [
+              # Image / Diffusion Models
               "x/z-image-turbo:latest",
               "x/flux2-klein:latest",
+              "flux2-klein:4b",
+
+              # Vision & OCR
               "deepseek-ocr:latest",
               "it:deepseek-ocr:latest",
-              "flux2-klein:4b",
+
+              # Community & Fine-tuned
               "goonsai/qwen2.5-3b-goonsai-nsfw-100k:latest",
               "REOinc/REO.AI:latest",
               "MrTails/Tails-assistant-ai-v3.0.0:latest",
@@ -137,6 +145,8 @@ jobs:
               "qwen3.8:27b",
               "parable/fable:3b",
               "parable/fable:4b",
+
+              # General LLMs (Qwen, DeepSeek, Llama, etc.)
               "qwen2.5:0.5b",
               "qwen2.5:1.5b",
               "qwen2.5:3b",
@@ -162,6 +172,12 @@ jobs:
               "orca-mini:3b",
               "stablelm2:1.6b"
           ]
+
+          IMAGE_MODEL_PREFIXES = ("x/z-image", "x/flux", "flux", "stable-diffusion")
+
+          def is_image_model(model_name: str) -> bool:
+              m = model_name.lower()
+              return any(p in m for p in IMAGE_MODEL_PREFIXES)
 
           class ChatMessage(BaseModel):
               role: str
@@ -191,7 +207,7 @@ jobs:
               return {
                   "cpu_threads": psutil.cpu_count(logical=True),
                   "ram_total": f"{psutil.virtual_memory().total / (1024**3):.1f} GB",
-                  "os": platform.system() + " " + platform.release() + " (Apple Silicon / MLX Enabled)"
+                  "os": platform.system() + " " + platform.release() + " (Apple Silicon / MLX)"
               }
 
           @app.get("/api/stats")
@@ -223,7 +239,8 @@ jobs:
                       for m in all_models:
                           result.append({
                               "name": m,
-                              "downloaded": m in downloaded
+                              "downloaded": m in downloaded,
+                              "type": "image" if is_image_model(m) else "text"
                           })
                       return {"models": result}
               except Exception as exc:
@@ -260,9 +277,43 @@ jobs:
 
           @app.post("/api/chat")
           async def chat(request: ChatRequest):
-              ollama_messages = [{"role": m.role, "content": m.content} for m in request.messages]
               async def generate():
                   try:
+                      # If it's an image model, forward prompt to /api/generate
+                      if is_image_model(request.model):
+                          prompt = request.messages[-1].content if request.messages else ""
+                          async with httpx.AsyncClient(timeout=300) as client:
+                              async with client.stream(
+                                  "POST",
+                                  f"{OLLAMA_HOST}/api/generate",
+                                  json={
+                                      "model": request.model,
+                                      "prompt": prompt,
+                                      "stream": False
+                                  },
+                              ) as response:
+                                  if response.status_code != 200:
+                                      body = await response.aread()
+                                      yield f"data: {json.dumps({'error': body.decode(errors='ignore')})}\n\n"
+                                      yield "data: [DONE]\n\n"
+                                      return
+                                  res_data = await response.json()
+                                  if err := res_data.get("error"):
+                                      yield f"data: {json.dumps({'error': err})}\n\n"
+                                  elif "response" in res_data:
+                                      # Check if Ollama returned image base64 data
+                                      content = res_data["response"]
+                                      yield f"data: {json.dumps({'content': content})}\n\n"
+                                  elif "image" in res_data:
+                                      img_tag = f"![Generated Image](data:image/png;base64,{res_data['image']})"
+                                      yield f"data: {json.dumps({'content': img_tag})}\n\n"
+                                  else:
+                                      yield f"data: {json.dumps({'content': str(res_data)})}\n\n"
+                                  yield "data: [DONE]\n\n"
+                                  return
+
+                      # Standard LLM Chat Handling
+                      ollama_messages = [{"role": m.role, "content": m.content} for m in request.messages]
                       async with httpx.AsyncClient(timeout=180) as client:
                           async with client.stream(
                               "POST",
@@ -298,7 +349,7 @@ jobs:
                                   if content:
                                       yield f"data: {json.dumps({'content': content})}\n\n"
                   except Exception as exc:
-                      logger.exception("chat stream failed")
+                      logger.exception("inference execution failed")
                       yield f"data: {json.dumps({'error': str(exc)})}\n\n"
                   yield "data: [DONE]\n\n"
               return StreamingResponse(generate(), media_type="text/event-stream")
@@ -309,7 +360,7 @@ jobs:
           <head>
           <meta charset="UTF-8">
           <meta name="viewport" content="width=device-width, initial-scale=1.0">
-          <title>Local LLM Studio (MLX Enabled)</title>
+          <title>Local Studio (MLX Hybrid)</title>
           
           <link rel="preconnect" href="https://fonts.googleapis.com">
           <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -333,6 +384,7 @@ jobs:
               --accent: #10b981;
               --accent-glow: rgba(16, 185, 129, 0.3);
               --cyan: #06b6d4;
+              --purple: #a855f7;
               --user-bg: rgba(6, 182, 212, 0.05);
               --assistant-bg: transparent;
               --input-bg: rgba(24, 24, 27, 0.75);
@@ -379,6 +431,9 @@ jobs:
             .model-item.active { background: rgba(6, 182, 212, 0.12); border-color: rgba(6, 182, 212, 0.4); }
             .model-meta { display: flex; flex-direction: column; gap: 2px; overflow: hidden; }
             .model-name { font-weight: 500; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 155px; }
+            .model-type-badge { font-size: 9px; padding: 2px 4px; border-radius: 4px; width: fit-content; text-transform: uppercase; }
+            .model-type-badge.image { background: rgba(168, 85, 247, 0.2); color: var(--purple); }
+            .model-type-badge.text { background: rgba(6, 182, 212, 0.2); color: var(--cyan); }
             .model-status { font-size: 11px; }
             .model-status.ready { color: var(--ok); }
             .model-status.pending { color: var(--text-secondary); }
@@ -435,6 +490,7 @@ jobs:
             .message-body { flex: 1; overflow-x: auto; min-width: 0; padding-top: 4px; }
             .message-body p { margin: 0 0 16px; }
             .message-body p:last-child { margin-bottom: 0; }
+            .message-body img { max-width: 100%; height: auto; border-radius: 12px; margin: 12px 0; border: 1px solid var(--border); }
             .message-body pre {
               background: var(--code-bg); color: #e2e8f0; padding: 35px 16px 16px; border-radius: 10px;
               overflow-x: auto; margin: 16px 0; border: 1px solid var(--border); position: relative;
@@ -475,7 +531,7 @@ jobs:
             .stop-btn:hover { background: #dc2626; }
             .send-btn:disabled { opacity: 0.5; cursor: not-allowed; }
             
-            /* Modal Overlay */
+            /* Modal */
             .modal-overlay {
               position: fixed; inset: 0; background: rgba(0,0,0,0.8); backdrop-filter: blur(8px);
               display: none; align-items: center; justify-content: center; z-index: 100;
@@ -578,7 +634,7 @@ jobs:
               </div>
               <div class="input-area-wrapper">
                 <div class="input-box">
-                  <textarea id="userInput" placeholder="Message local model... (Markdown, code, math supported)" rows="1"></textarea>
+                  <textarea id="userInput" placeholder="Message or enter image prompt..." rows="1"></textarea>
                   <button class="send-btn" id="sendButton" onclick="sendMessage()">↑</button>
                   <button class="stop-btn" id="stopButton" onclick="stopGenerating()">■</button>
                 </div>
@@ -610,7 +666,7 @@ jobs:
               }
             }
 
-            const STORE_KEY = 'llama-ui-glass-mlx';
+            const STORE_KEY = 'llama-ui-glass-hybrid';
             const chatContainer = document.getElementById('chatContainer');
             const userInput = document.getElementById('userInput');
             const sendButton = document.getElementById('sendButton');
@@ -630,7 +686,7 @@ jobs:
             const modalLogs = document.getElementById('modalLogs');
             const modalCloseBtn = document.getElementById('modalCloseBtn');
 
-            let isStreaming = false, totalTokens = 0, messageHistory = [], controller = null, currentModel = null;
+            let isStreaming = false, totalTokens = 0, messageHistory = [], controller = null, currentModel = null, currentModelType = 'text';
             let statPollInterval;
 
             async function fetchSysInfo() {
@@ -677,9 +733,12 @@ jobs:
                 }
 
                 modelListContainer.innerHTML = models.map(m => `
-                  <div class="model-item ${m.name === currentModel ? 'active' : ''}" onclick="${m.downloaded ? `selectModel('${m.name}')` : ''}">
+                  <div class="model-item ${m.name === currentModel ? 'active' : ''}" onclick="${m.downloaded ? `selectModel('${m.name}', '${m.type}')` : ''}">
                     <div class="model-meta">
-                      <span class="model-name" title="${m.name}">${m.name}</span>
+                      <div style="display:flex; align-items:center; gap:6px;">
+                        <span class="model-name" title="${m.name}">${m.name}</span>
+                        <span class="model-type-badge ${m.type}">${m.type}</span>
+                      </div>
                       <span class="model-status ${m.downloaded ? 'ready' : 'pending'}">${m.downloaded ? '🟢 Ready' : '📥 Not Downloaded'}</span>
                     </div>
                     ${!m.downloaded ? `<button class="dl-btn" onclick="startModelDownload('${m.name}', event)">Download</button>` : ''}
@@ -688,16 +747,16 @@ jobs:
 
                 const downloaded = models.filter(m => m.downloaded);
                 if (!currentModel && downloaded.length > 0) {
-                  currentModel = downloaded[0].name;
-                  updateModelTag();
+                  selectModel(downloaded[0].name, downloaded[0].type);
                 }
               } catch (e) {
                 modelListContainer.innerHTML = '<div style="padding: 10px; text-align: center; color: var(--danger);">Error loading models</div>';
               }
             }
 
-            function selectModel(modelName) {
+            function selectModel(modelName, modelType = 'text') {
               currentModel = modelName;
+              currentModelType = modelType;
               updateModelTag();
               saveState();
               loadModels();
@@ -803,7 +862,7 @@ jobs:
                 modalBar.style.background = 'var(--ok)';
                 modalPercent.textContent = '100%';
                 modalStatus.textContent = 'Completed successfully!';
-                appendLog(`[Success] Model ${modelName} ready with MLX support.`);
+                appendLog(`[Success] Model ${modelName} ready.`);
                 modalCloseBtn.disabled = false;
                 modalCloseBtn.textContent = 'Done & Select';
                 modalCloseBtn.onclick = () => {
@@ -824,14 +883,14 @@ jobs:
             }
 
             function updateModelTag() {
-              currentModelTag.textContent = currentModel ? '📦 ' + currentModel : '📦 (no model selected)';
+              currentModelTag.textContent = currentModel ? `📦 ${currentModel} (${currentModelType})` : '📦 (no model selected)';
             }
 
             function saveState() {
               try {
                 localStorage.setItem(STORE_KEY, JSON.stringify({
                   temperature: temperatureEl.value, maxTokens: maxTokensEl.value,
-                  messageHistory, totalTokens, model: currentModel
+                  messageHistory, totalTokens, model: currentModel, modelType: currentModelType
                 }));
               } catch { }
             }
@@ -843,7 +902,7 @@ jobs:
                 const s = JSON.parse(raw);
                 if (s.temperature) { temperatureEl.value = s.temperature; document.getElementById('tempVal').textContent = s.temperature; }
                 if (s.maxTokens) { maxTokensEl.value = s.maxTokens; document.getElementById('tokenVal').textContent = s.maxTokens; }
-                if (s.model) { currentModel = s.model; updateModelTag(); }
+                if (s.model) { currentModel = s.model; currentModelType = s.modelType || 'text'; updateModelTag(); }
                 if (Array.isArray(s.messageHistory)) {
                   messageHistory = s.messageHistory; totalTokens = s.totalTokens || 0;
                   messageHistory.forEach(m => appendMessage(m.role, m.content));
@@ -913,7 +972,7 @@ jobs:
               userInput.value = ''; userInput.style.height = 'auto';
               sendButton.style.display = 'none'; stopButton.style.display = 'flex';
               isStreaming = true; controller = new AbortController();
-              appendMessage('assistant', 'Processing', true);
+              appendMessage('assistant', currentModelType === 'image' ? 'Generating Image (Please wait)...' : 'Processing...', true);
 
               setPolling(true);
 
@@ -964,7 +1023,7 @@ jobs:
                   updateLastAssistantMessage(fullContent + '\n\n*(stopped)*', true);
                   if (fullContent) { messageHistory.push({ role: 'assistant', content: fullContent }); saveState(); }
                 } else {
-                  updateLastAssistantMessage(`⚠️ ${error.message || 'Error generating response.'}`, true);
+                  updateLastAssistantMessage(`⚠️ ${error.message || 'Error executing request.'}`, true);
                 }
               }
 
@@ -976,7 +1035,7 @@ jobs:
             loadModels().then(() => {
               restoreState();
               const welcome = document.getElementById('welcomeMsg');
-              renderInto(welcome, `System ready on macOS Apple Silicon. MLX runtime is fully loaded. Select or download any model to begin.`);
+              renderInto(welcome, `System initialized on macOS with native MLX support. Supports both Conversational Text (LLMs) and Image Generation models.`);
             });
           </script>
           </body>
@@ -1036,17 +1095,17 @@ jobs:
           fi
           echo ""
           echo "╔═══════════════════════════════════════════════════════════════════╗"
-          echo "║       🎉  Y O U R   M L X   L L M   I S   R E A D Y  🎉          ║"
+          echo "║       🎉  Y O U R   M L X   S T U D I O   I S   R E A D Y  🎉    ║"
           echo "╠═══════════════════════════════════════════════════════════════════╣"
           echo "║  🔗  $TUNNEL_URL"
           echo "╚═══════════════════════════════════════════════════════════════════╝"
           {
-            echo "## 🦙 Your LLM web UI is live (Apple Silicon / MLX)"
+            echo "## 🦙 Your LLM & Image Web UI is live"
             echo ""
             echo "**URL:** $TUNNEL_URL"
             echo ""
             echo "**Context:** ${CONTEXT_SIZE} tokens"
-            echo "**Architecture:** Apple Silicon (macOS) with native MLX support."
+            echo "**Runner:** Apple Silicon macOS (Native MLX Support)"
             echo ""
             echo "> This link stays live for as long as this job keeps running (up to the 6-hour timeout, or until you cancel the run)."
           } >> "$GITHUB_STEP_SUMMARY"
