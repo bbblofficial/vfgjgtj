@@ -40,24 +40,9 @@ jobs:
           echo "  🔌 Port:    ${PORT}"
           echo "  🏃 Runner:  $(uname -a)"
           echo "  🧠 Chip:    $(sysctl -n machdep.cpu.brand_string 2>/dev/null || uname -m)"
-          echo "  💽 Disk before cleanup:"
+          echo "  💽 Disk status:"
           df -h / | tail -1
-
-      - name: 🧹 Deep disk cleanup (Aggressive space reclaim)
-        run: |
-          echo "──────────────────────────────────────────"
-          echo " 🧹  Purging heavy SDKs, caches, and runtimes"
-          echo "──────────────────────────────────────────"
-          sudo rm -rf /Applications/Xcode*.app 2>/dev/null || true
-          sudo rm -rf /Library/Developer/CoreSimulator 2>/dev/null || true
-          sudo rm -rf /Users/runner/Library/Android 2>/dev/null || true
-          sudo rm -rf /usr/local/share/dotnet 2>/dev/null || true
-          sudo rm -rf /Library/Frameworks/Mono.framework 2>/dev/null || true
-          sudo rm -rf /Users/runner/Library/Caches/* 2>/dev/null || true
-          
           mkdir -p /Users/runner/ollama_models
-          echo "  💽 Available disk space after purge:"
-          df -h / | tail -1
 
       - name: 🐍 Setup Python
         uses: actions/setup-python@v5
@@ -67,12 +52,14 @@ jobs:
       - name: 📦 Install Ollama, MLX & Python packages
         run: |
           echo "──────────────────────────────────────────"
-          echo " 📦  Installing Ollama Standalone Binary (Bypassing Homebrew OpenSSL issue)"
+          echo " 📦  Installing Official Ollama App + MLX"
           echo "──────────────────────────────────────────"
-          # دانلود مستقیم باینری مستقل و رسمی اولاما برای macOS بدون خطای Homebrew
-          curl -fsSL https://ollama.com/download/ollama-darwin -o /tmp/ollama
-          chmod +x /tmp/ollama
-          sudo mv /tmp/ollama /usr/local/bin/ollama
+          # دانلود بسته رسمی و مستقیم Ollama مخصوص macOS از گیت‌هاب
+          curl -fsSL https://github.com/ollama/ollama/releases/latest/download/Ollama-darwin.zip -o /tmp/Ollama-darwin.zip
+          unzip -q /tmp/Ollama-darwin.zip -d /tmp/ollama_app
+          sudo cp /tmp/ollama_app/Ollama.app/Contents/Resources/ollama /usr/local/bin/ollama
+          sudo chmod +x /usr/local/bin/ollama
+          rm -rf /tmp/Ollama-darwin.zip /tmp/ollama_app
 
           # نصب پکیج‌های پایتون و MLX
           pip install --no-cache-dir \
@@ -1095,7 +1082,6 @@ jobs:
 
       - name: 📦 Install cloudflared (macOS Darwin)
         run: |
-          # نصب مستقیم باینری مستقل cloudflared بدون وابستگی به brew
           curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64 -o /tmp/cloudflared
           chmod +x /tmp/cloudflared
           sudo mv /tmp/cloudflared /usr/local/bin/cloudflared
