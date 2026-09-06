@@ -1,4 +1,4 @@
-name: 🦙 Local Studio Pro (Multimodal & Live Stream)
+name: 🦙 Local LLM Web Interface (Optimized)
 
 on:
   workflow_dispatch:
@@ -23,96 +23,81 @@ concurrency:
 
 jobs:
   deploy-llama:
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
       CONTEXT_SIZE: ${{ inputs.context_size }}
       PORT: ${{ inputs.port }}
-      OLLAMA_MODELS: /Users/runner/ollama_models
-
     steps:
       - name: 🦙 Show banner
         run: |
           echo "╔═══════════════════════════════════════════════════════════════════╗"
-          echo "║   🦙  M A C O S   A P P L E   S I L I C O N   ( M U L T I M O D A L ) ║"
+          echo "║    🦙  L O C A L    L L M    W E B    U I    ( O P T I M I Z E D )     ║"
           echo "╚═══════════════════════════════════════════════════════════════════╝"
           echo "  📝 Context: ${CONTEXT_SIZE} tokens"
           echo "  🔌 Port:    ${PORT}"
           echo "  🏃 Runner:  $(uname -a)"
-          echo "  🧠 Chip:    $(sysctl -n machdep.cpu.brand_string 2>/dev/null || uname -m)"
-          echo "  💽 Disk status:"
+          echo "  💾 Memory:  $(free -h | awk '/Mem:/{print $2}')"
+          echo "  🧠 CPUs:    $(nproc)"
+          echo "  ⏱️ Timeout:  6 Hours (360 minutes)"
+          echo "  💽 Disk before cleanup:"
           df -h / | tail -1
-          mkdir -p /Users/runner/ollama_models
+
+
 
       - name: 🐍 Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: 📦 Install Ollama Bundle & Python packages
+      - name: 📦 Install dependencies
         run: |
           echo "──────────────────────────────────────────"
-          echo " 📦  Installing Ollama Release & Web Stack"
+          echo " 📦  Installing Ollama + Python packages"
           echo "──────────────────────────────────────────"
-          curl -fsSL https://github.com/ollama/ollama/releases/download/v0.33.3/Ollama-darwin.zip -o /tmp/Ollama-darwin.zip
-          sudo unzip -q /tmp/Ollama-darwin.zip -d /Applications/
-          sudo ln -sf /Applications/Ollama.app/Contents/Resources/ollama /usr/local/bin/ollama
-          rm -f /tmp/Ollama-darwin.zip
-
+          curl -fsSL https://ollama.com/install.sh | sh
           pip install --no-cache-dir \
             fastapi uvicorn aiohttp httpx python-multipart \
             jinja2 websockets pydantic psutil
+          ollama --version
+          python --version
 
-          /usr/local/bin/ollama --version
-
-      - name: 🚀 Start Ollama engine
+      - name: 🚀 Start Ollama server
         run: |
           echo "──────────────────────────────────────────"
-          echo " 🚀  Starting Ollama Engine"
+          echo " 🚀  Starting Ollama"
           echo "──────────────────────────────────────────"
-          export OLLAMA_MODELS="/Users/runner/ollama_models"
-          export OLLAMA_HOST="0.0.0.0:11434"
-          export OLLAMA_KEEP_ALIVE="24h"
-          export OLLAMA_MAX_LOADED_MODELS=1
-          export OLLAMA_NUM_PARALLEL=1
-          export OLLAMA_FLASH_ATTENTION=1
-
-          nohup /Applications/Ollama.app/Contents/Resources/ollama serve > /tmp/ollama.log 2>&1 &
+          sudo systemctl stop ollama 2>/dev/null || true
+          sudo systemctl disable ollama 2>/dev/null || true
+          nohup ollama serve > /tmp/ollama.log 2>&1 &
           echo $! > /tmp/ollama.pid
-
-          echo "⏳ Waiting for Ollama engine to report healthy..."
+          echo "⏳ Waiting for Ollama to become ready..."
           ready=false
           for i in $(seq 1 30); do
             if curl -sf http://localhost:11434/api/tags > /dev/null 2>&1; then
-              echo "✅ Ollama Engine is live!"
+              echo "✅ Ollama is ready!"
               ready=true
               break
             fi
             sleep 2
           done
-
           if [ "$ready" != "true" ]; then
             echo "❌ Ollama failed to start. Last logs:"
             tail -n 50 /tmp/ollama.log || true
             exit 1
           fi
 
-      - name: 📥 Verify Repository state
-        run: |
-          ollama list
-
-      - name: 🔧 Write the web server (Console UI & Activity Stream Engine)
+      - name: 🔧 Write the web server (Glassmorphism UI)
         run: |
           cat > ollama_server.py << 'PYEOF'
           #!/usr/bin/env python3
           import json
           import os
-          import re
           import logging
           import platform
-          import asyncio
           import psutil
-          from typing import Optional
+          import subprocess
+          from typing import Optional, List
           import httpx
           import uvicorn
           from fastapi import FastAPI, HTTPException
@@ -120,67 +105,49 @@ jobs:
           from pydantic import BaseModel
 
           logging.basicConfig(level=logging.INFO)
-          logger = logging.getLogger("studio-ui")
+          logger = logging.getLogger("llama-ui")
 
-          OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+          OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
           CONTEXT_SIZE = int(os.getenv("CONTEXT_SIZE", "4096"))
           PORT = int(os.getenv("PORT", "7860"))
 
-          app = FastAPI(title="Local Studio (Pro)")
+          app = FastAPI(title="Local LLM UI (Optimized)")
 
-          # NOTE: Ollama only runs text / vision-input GGUF models — it has no
-          # text-to-image or text-to-video capability. Models below marked
-          # "vision" accept an uploaded image as INPUT (via the `images` field)
-          # and return TEXT (a description, OCR output, etc). None of them
-          # produce a generated picture as output.
+          # Curated catalog of models available for on-demand pull
           CATALOG_MODELS = [
-              "llama3.2:3b",
-              "llama3.2:1b",
-              "qwen2.5:3b",
-              "qwen2.5:1.5b",
-              "qwen2.5-coder:1.5b",
-              "deepseek-r1:1.5b",
-              "gemma2:2b",
-              "tinyllama",
-              "llava:7b",
-              "qwen2.5vl:3b",
-              "deepseek-ocr:latest",
+              {"name": "qwen2.5:0.5b", "type": "general"},
+              {"name": "qwen2.5:1.5b", "type": "general"},
+              {"name": "qwen2.5:3b", "type": "general"},
+              {"name": "qwen2.5:7b", "type": "general"},
+              {"name": "qwen2.5-coder:0.5b", "type": "code"},
+              {"name": "qwen2.5-coder:1.5b", "type": "code"},
+              {"name": "qwen2.5-coder:3b", "type": "code"},
+              {"name": "qwen2.5-coder:7b", "type": "code"},
+              {"name": "deepseek-r1:1.5b", "type": "reasoning"},
+              {"name": "deepseek-r1:7b", "type": "reasoning"},
+              {"name": "deepseek-coder:1.3b", "type": "code"},
+              {"name": "deepseek-coder:6.7b", "type": "code"},
+              {"name": "llama3.2:1b", "type": "general"},
+              {"name": "llama3.2:3b", "type": "general"},
+              {"name": "tinyllama", "type": "general"},
+              {"name": "gemma2:2b", "type": "general"},
+              {"name": "phi3.5", "type": "general"},
+              {"name": "phi3:mini", "type": "general"},
+              {"name": "mistral:7b", "type": "general"},
+              {"name": "openhermes", "type": "general"},
+              {"name": "dolphin-mistral", "type": "general"},
+              {"name": "smollm:1.7b", "type": "general"},
+              {"name": "orca-mini:3b", "type": "general"},
+              {"name": "stablelm2:1.6b", "type": "general"}
           ]
 
-          VISION_MODEL_PREFIXES = ("llava", "qwen2.5vl", "qwen2-vl", "deepseek-ocr", "bakllava", "moondream")
-
-          # Models known to be prone to crashing their llama-server backend
-          # (SIGABRT / "process has terminated") on constrained or emulated
-          # GPU environments like CI runners. Flagged in the UI so people
-          # aren't left guessing when the abort happens.
-          EXPERIMENTAL_MODEL_PREFIXES = ("deepseek-ocr",)
-
-          # Substrings that show up in Ollama's error body when the underlying
-          # llama-server / MLX subprocess has crashed outright, as opposed to
-          # a normal validation error (bad model name, malformed request, etc).
-          BACKEND_CRASH_MARKERS = ("terminated", "abort trap", "signal:", "exit status")
-
-          def is_vision_model(model_name: str) -> bool:
-              m = model_name.lower()
-              return any(p in m for p in VISION_MODEL_PREFIXES)
-
-          def is_experimental_model(model_name: str) -> bool:
-              m = model_name.lower()
-              return any(p in m for p in EXPERIMENTAL_MODEL_PREFIXES)
-
-          def looks_like_backend_crash(text: str) -> bool:
-              t = text.lower()
-              return any(marker in t for marker in BACKEND_CRASH_MARKERS)
-
-          def clean_ansi(text: str) -> str:
-              ansi_escape = re.compile(r'(?:\x1B[@-_]|[\x80-\x9F])[0-?]*[ -/]*[@-~]')
-              text = ansi_escape.sub('', text)
-              text = re.sub(r'\[\?[0-9;]*[a-zA-Z]', '', text)
-              text = re.sub(r'\[[0-9;]*[a-zA-Z]', '', text)
-              return text.strip()
+          class ChatMessage(BaseModel):
+              role: str
+              content: str
+              images: Optional[List[str]] = None
 
           class ChatRequest(BaseModel):
-              messages: list
+              messages: List[ChatMessage]
               model: str
               temperature: Optional[float] = 0.7
               max_tokens: Optional[int] = 2048
@@ -200,279 +167,143 @@ jobs:
 
           @app.get("/api/sysinfo")
           def sysinfo():
-              vmem = psutil.virtual_memory()
               return {
                   "cpu_threads": psutil.cpu_count(logical=True),
-                  "ram_total": f"{vmem.total / (1024**3):.1f} GB",
+                  "ram_total": f"{psutil.virtual_memory().total / (1024**3):.1f} GB",
                   "os": platform.system() + " " + platform.release()
               }
 
           @app.get("/api/stats")
           def stats():
               disk = psutil.disk_usage('/')
-              vmem = psutil.virtual_memory()
               return {
                   "cpu_percent": psutil.cpu_percent(interval=None),
-                  "ram_percent": vmem.percent,
-                  "ram_used": f"{vmem.used / (1024**3):.1f} GB",
-                  "disk_free": f"{disk.free / (1024**3):.1f} GB"
+                  "ram_percent": psutil.virtual_memory().percent,
+                  "ram_used": f"{psutil.virtual_memory().used / (1024**3):.1f} GB",
+                  "disk_free": f"{disk.free / (1024**3):.1f} GB free"
               }
 
           @app.get("/api/models")
           async def list_models():
               try:
-                  async with httpx.AsyncClient(timeout=10) as client:
+                  async with httpx.AsyncClient(timeout=5) as client:
                       r = await client.get(f"{OLLAMA_HOST}/api/tags")
                       r.raise_for_status()
                       data = r.json()
-                      downloaded_raw = [m["name"] for m in data.get("models", [])]
-                      downloaded = set(downloaded_raw)
+                      pulled_names = {m["name"] for m in data.get("models", [])}
 
-                      for m in downloaded_raw:
-                          if m.endswith(":latest"):
-                              downloaded.add(m[:-7])
-                          else:
-                              downloaded.add(f"{m}:latest")
-
-                      all_models = list(dict.fromkeys(downloaded_raw + CATALOG_MODELS))
-                      result = []
-                      for m in all_models:
-                          result.append({
-                              "name": m,
-                              "downloaded": m in downloaded,
-                              "type": "vision" if is_vision_model(m) else "text",
-                              "experimental": is_experimental_model(m)
-                          })
-                      return {"models": result}
+                  models_payload = []
+                  for item in CATALOG_MODELS:
+                      name = item["name"]
+                      models_payload.append({
+                          "name": name,
+                          "type": item["type"],
+                          "downloaded": name in pulled_names
+                      })
+                  return {"models": models_payload}
               except Exception as exc:
                   raise HTTPException(status_code=503, detail=str(exc))
 
           @app.post("/api/pull")
-          async def pull_model(request: PullRequest):
-              async def generate():
-                  cmd = ["/Applications/Ollama.app/Contents/Resources/ollama", "pull", request.model]
-                  env = os.environ.copy()
-                  env["OLLAMA_MODELS"] = "/Users/runner/ollama_models"
-
-                  proc = await asyncio.create_subprocess_exec(
-                      *cmd,
-                      stdout=asyncio.subprocess.PIPE,
-                      stderr=asyncio.subprocess.STDOUT,
-                      env=env
-                  )
-
-                  pct_pattern = re.compile(r'(\d+)%')
-                  speed_pattern = re.compile(r'([0-9\.]+\s*(?:KB|MB|GB)/s)')
-                  size_pattern = re.compile(r'([0-9\.]+\s*(?:KB|MB|GB)\s*/\s*[0-9\.]+\s*(?:KB|MB|GB))')
-                  eta_pattern = re.compile(r'(\d+[m|s]\w*)')
-
-                  buffer = ""
+          async def pull_model(req: PullRequest):
+              async def generate_pull():
                   try:
-                      while True:
-                          chunk = await proc.stdout.read(128)
-                          if not chunk:
-                              break
-                          buffer += chunk.decode('utf-8', errors='ignore')
-
-                          while '\r' in buffer or '\n' in buffer:
-                              delim = '\r' if '\r' in buffer else '\n'
-                              part, buffer = buffer.split(delim, 1)
-                              cleaned = clean_ansi(part)
-                              if not cleaned:
-                                  continue
-
-                              pct_match = pct_pattern.search(cleaned)
-                              pct = int(pct_match.group(1)) if pct_match else None
-
-                              msg = {
-                                  "raw": cleaned,
-                                  "percent": pct,
-                                  "speed": speed_pattern.search(cleaned).group(1) if speed_pattern.search(cleaned) else "",
-                                  "size": size_pattern.search(cleaned).group(1) if size_pattern.search(cleaned) else "",
-                                  "eta": eta_pattern.search(cleaned).group(1) if eta_pattern.search(cleaned) else ""
-                              }
-                              yield f"data: {json.dumps(msg)}\n\n"
-
-                      await proc.wait()
-                      if proc.returncode == 0:
-                          yield f"data: {json.dumps({'status': 'Completed successfully!', 'percent': 100})}\n\n"
-                      else:
-                          yield f"data: {json.dumps({'error': f'Pull process failed with exit code {proc.returncode}'})}\n\n"
+                      process = subprocess.Popen(
+                          ["ollama", "pull", req.model],
+                          stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT,
+                          text=True
+                      )
+                      for line in process.stdout:
+                          line_str = line.strip()
+                          if not line_str:
+                              continue
+                          percent = None
+                          if "%" in line_str:
+                              parts = line_str.split()
+                              for p in parts:
+                                  if p.endswith("%"):
+                                      try:
+                                          percent = int(p.rstrip("%"))
+                                      except ValueError:
+                                          pass
+                          yield f"data: {json.dumps({'raw': line_str, 'percent': percent})}\n\n"
+                      process.wait()
+                      if process.returncode != 0:
+                          yield f"data: {json.dumps({'error': 'Pull command failed'})}\n\n"
+                      yield "data: [DONE]\n\n"
                   except Exception as e:
                       yield f"data: {json.dumps({'error': str(e)})}\n\n"
-
-                  yield "data: [DONE]\n\n"
-
-              return StreamingResponse(
-                  generate(),
-                  media_type="text/event-stream",
-                  headers={"Cache-Control": "no-cache", "Connection": "keep-alive"}
-              )
+              return StreamingResponse(generate_pull(), media_type="text/event-stream")
 
           @app.get("/", response_class=HTMLResponse)
           async def root():
               return HTML_TEMPLATE
 
-          async def _attempt_ollama_chat(client, ollama_messages, model, temperature, max_tokens, force_cpu=False):
-              """
-              Makes one streaming call to Ollama's /api/chat. Returns a tuple:
-              (outcome, payload)
-                outcome == "crash"   -> payload is the raw crash body (str); caller may retry
-                outcome == "http_error" -> payload is a cleaned error string; no retry
-                outcome == "stream" -> payload is an async generator of SSE-ready dict frames
-              A crash (llama-server / MLX subprocess aborting) surfaces as a non-200
-              response whose body mentions "terminated" / "abort trap" / a signal —
-              distinct from an ordinary validation error like an unknown model name.
-              """
-              options = {
-                  "temperature": temperature,
-                  "num_predict": max_tokens,
-                  "num_ctx": CONTEXT_SIZE,
-              }
-              if force_cpu:
-                  # Forces llama.cpp/MLX to run on CPU instead of the Metal/GPU
-                  # path. This avoids a class of SIGABRT crashes seen with some
-                  # vision-model backends on virtualized/CI Apple Silicon, at
-                  # the cost of much slower generation.
-                  options["num_gpu"] = 0
-
-              req = client.stream(
-                  "POST",
-                  f"{OLLAMA_HOST}/api/chat",
-                  json={
-                      "model": model,
-                      "messages": ollama_messages,
-                      "stream": True,
-                      "options": options,
-                  },
-              )
-              response = await req.__aenter__()
-              try:
-                  if response.status_code != 200:
-                      body = (await response.aread()).decode(errors="ignore")
-                      cleaned = clean_ansi(body)
-                      await req.__aexit__(None, None, None)
-                      if looks_like_backend_crash(cleaned):
-                          return ("crash", cleaned)
-                      return ("http_error", cleaned)
-
-                  async def frames():
-                      try:
-                          async for line in response.aiter_lines():
-                              line = line.strip()
-                              if not line:
-                                  continue
-                              try:
-                                  obj = json.loads(line)
-                              except json.JSONDecodeError:
-                                  continue
-                              if err := obj.get("error"):
-                                  cleaned_err = clean_ansi(err)
-                                  if looks_like_backend_crash(cleaned_err):
-                                      yield {"crash_mid_stream": cleaned_err}
-                                  else:
-                                      yield {"error": cleaned_err}
-                                  continue
-                              content = obj.get("message", {}).get("content")
-                              if content:
-                                  yield {"content": content}
-                      finally:
-                          await req.__aexit__(None, None, None)
-
-                  return ("stream", frames())
-              except Exception:
-                  await req.__aexit__(None, None, None)
-                  raise
-
           @app.post("/api/chat")
           async def chat(request: ChatRequest):
+              ollama_messages = []
+              for m in request.messages:
+                  msg_dict = {"role": m.role, "content": m.content}
+                  if m.images:
+                      msg_dict["images"] = m.images
+                  ollama_messages.append(msg_dict)
+
               async def generate():
                   try:
-                      yield f"data: {json.dumps({'activity': 'Loading weights into unified memory...'})}\n\n"
-                      await asyncio.sleep(0.1)
-
-                      # All models here are text-generation (or vision-input/text-output)
-                      # models served through Ollama's native /api/chat endpoint.
-                      # Images the user attaches are passed through as `images`
-                      # on the message; Ollama does not generate images or video.
-                      ollama_messages = []
-                      for m in request.messages:
-                          msg_dict = {"role": m["role"], "content": m["content"]}
-                          if "images" in m and m["images"]:
-                              msg_dict["images"] = m["images"]
-                          ollama_messages.append(msg_dict)
-
-                      last_msg = request.messages[-1] if request.messages else {}
-                      if last_msg.get("images") and not is_vision_model(request.model):
-                          yield f"data: {json.dumps({'activity': 'Note: this model has no vision support — the attached image will be ignored.'})}\n\n"
-
-                      yield f"data: {json.dumps({'activity': f'Generating with {request.model}...'})}\n\n"
-
-                      async with httpx.AsyncClient(timeout=600) as client:
-                          outcome, payload = await _attempt_ollama_chat(
-                              client, ollama_messages, request.model,
-                              request.temperature, request.max_tokens, force_cpu=False
-                          )
-
-                          if outcome == "crash":
-                              yield f"data: {json.dumps({'activity': 'Model backend crashed (abort trap) — retrying in CPU-only mode, this will be slower...'})}\n\n"
-                              outcome, payload = await _attempt_ollama_chat(
-                                  client, ollama_messages, request.model,
-                                  request.temperature, request.max_tokens, force_cpu=True
-                              )
-                              if outcome == "crash":
-                                  hint = (
-                                      f"'{request.model}' crashed its inference backend twice in a row "
-                                      "(signal: abort trap), including on CPU-only mode. This usually means "
-                                      "the model's backend isn't stable on this runner — often from insufficient "
-                                      "RAM for the model's weights, or the model/quantization not being fully "
-                                      "supported by this Ollama build yet. Try a smaller model, a well-established "
-                                      "vision model such as llava or qwen2.5vl, or a runner with more memory."
-                                  )
-                                  yield f"data: {json.dumps({'error': hint})}\n\n"
+                      async with httpx.AsyncClient(timeout=180) as client:
+                          async with client.stream(
+                              "POST",
+                              f"{OLLAMA_HOST}/api/chat",
+                              json={
+                                  "model": request.model,
+                                  "messages": ollama_messages,
+                                  "stream": True,
+                                  "options": {
+                                      "temperature": request.temperature,
+                                      "num_predict": request.max_tokens,
+                                      "num_ctx": CONTEXT_SIZE,
+                                  },
+                              },
+                          ) as response:
+                              if response.status_code != 200:
+                                  body = await response.aread()
+                                  yield f"data: {json.dumps({'error': body.decode(errors='ignore')})}\n\n"
                                   yield "data: [DONE]\n\n"
                                   return
-
-                          if outcome == "http_error":
-                              yield f"data: {json.dumps({'error': payload})}\n\n"
-                              yield "data: [DONE]\n\n"
-                              return
-
-                          yield f"data: {json.dumps({'activity': 'Streaming tokens...'})}\n\n"
-                          async for frame in payload:
-                              if "crash_mid_stream" in frame:
-                                  hint = (
-                                      f"'{request.model}' crashed its inference backend mid-response "
-                                      f"(signal: abort trap): {frame['crash_mid_stream']}. Partial output above "
-                                      "may be incomplete. This model may be unstable on this runner — try again, "
-                                      "or switch to a smaller / more established model."
-                                  )
-                                  yield f"data: {json.dumps({'error': hint})}\n\n"
-                                  continue
-                              yield f"data: {json.dumps(frame)}\n\n"
+                              async for line in response.aiter_lines():
+                                  line = line.strip()
+                                  if not line:
+                                      continue
+                                  try:
+                                      obj = json.loads(line)
+                                  except json.JSONDecodeError:
+                                      continue
+                                  if err := obj.get("error"):
+                                      yield f"data: {json.dumps({'error': err})}\n\n"
+                                      continue
+                                  content = obj.get("message", {}).get("content")
+                                  if content:
+                                      yield f"data: {json.dumps({'content': content})}\n\n"
                   except Exception as exc:
-                      logger.exception("execution error")
-                      yield f"data: {json.dumps({'error': clean_ansi(str(exc))})}\n\n"
+                      logger.exception("chat stream failed")
+                      yield f"data: {json.dumps({'error': str(exc)})}\n\n"
                   yield "data: [DONE]\n\n"
               return StreamingResponse(generate(), media_type="text/event-stream")
 
-          HTML_TEMPLATE = r'''
-          <!DOCTYPE html>
+          HTML_TEMPLATE = r'''<!DOCTYPE html>
           <html lang="en">
           <head>
           <meta charset="UTF-8">
           <meta name="viewport" content="width=device-width, initial-scale=1.0">
           <title>Local Studio — Console</title>
-
           <link rel="preconnect" href="https://fonts.googleapis.com">
           <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
           <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-
           <script src="https://cdn.jsdelivr.net/npm/marked@4.3.0/marked.min.js"></script>
           <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.6/purify.min.js"></script>
           <link id="hljsTheme" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css">
           <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
-
           <style>
             :root {
               --ink: #131210;
@@ -494,29 +325,19 @@ jobs:
               --radius-s: 4px;
               --radius-m: 7px;
             }
-
             * { margin: 0; padding: 0; box-sizing: border-box; }
-
-            @media (prefers-reduced-motion: reduce) {
-              *, *::before, *::after { animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; }
-            }
-
             html, body { height: 100%; }
             body {
               background: var(--ink); color: var(--ivory); height: 100vh; display: flex; overflow: hidden;
-              font-family: 'IBM Plex Sans', -apple-system, sans-serif;
-              font-size: 15px;
+              font-family: 'IBM Plex Sans', -apple-system, sans-serif; font-size: 15px;
             }
             ::selection { background: var(--amber-dim); color: var(--ivory); }
             ::-webkit-scrollbar { width: 9px; height: 9px; }
             ::-webkit-scrollbar-track { background: transparent; }
             ::-webkit-scrollbar-thumb { background: var(--rule-bright); border-radius: 5px; border: 2px solid var(--ink); }
-
             a { color: var(--amber); }
             button { font-family: inherit; }
             :focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
-
-            /* ---------- Rack / sidebar ---------- */
             .rack {
               width: 308px; background: var(--panel); border-right: 1px solid var(--rule);
               display: flex; flex-direction: column; flex-shrink: 0; z-index: 30;
@@ -537,21 +358,18 @@ jobs:
               margin-left: auto; display: none; background: transparent; border: 1px solid var(--rule);
               color: var(--dust); width: 28px; height: 28px; border-radius: var(--radius-s); cursor: pointer;
             }
-
             .module { padding: 16px 18px; border-bottom: 1px solid var(--rule); }
             .module-label {
               font-size: 11.5px; font-weight: 500; color: var(--dust); margin-bottom: 10px;
               display: flex; align-items: center; justify-content: space-between;
             }
             .module-refresh { background: none; border: none; color: var(--amber); cursor: pointer; font-size: 11px; font-weight: 500; padding: 2px 4px; }
-
             .new-session-btn {
               display: flex; align-items: center; justify-content: center; gap: 7px; width: 100%; padding: 9px;
               background: var(--panel-raised); border: 1px solid var(--rule); border-radius: var(--radius-m); color: var(--ivory);
               font-size: 13px; font-weight: 500; cursor: pointer; transition: border-color 0.15s ease;
             }
             .new-session-btn:hover { border-color: var(--amber-line); }
-
             .model-list { display: flex; flex-direction: column; gap: 2px; max-height: 260px; overflow-y: auto; }
             .model-row {
               display: flex; align-items: center; gap: 9px; padding: 8px 8px; border-radius: var(--radius-s);
@@ -582,7 +400,6 @@ jobs:
             .dl-btn:hover { border-color: var(--amber-line); color: var(--amber); }
             .dl-btn:disabled { opacity: 0.45; cursor: not-allowed; }
             .model-list-empty { font-size: 12px; color: var(--dust-dim); padding: 10px 4px; }
-
             .field { display: flex; flex-direction: column; gap: 6px; margin-top: 14px; }
             .field:first-child { margin-top: 0; }
             .field-row { display: flex; justify-content: space-between; align-items: baseline; font-size: 12px; color: var(--dust); }
@@ -594,7 +411,6 @@ jobs:
               -webkit-appearance: none; width: 13px; height: 13px; border-radius: 50%; background: var(--amber);
               cursor: pointer; border: 2px solid var(--panel);
             }
-
             .meter { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
             .meter-label { font-size: 11.5px; color: var(--dust); width: 40px; flex-shrink: 0; }
             .meter-track { flex: 1; display: flex; gap: 2px; height: 8px; }
@@ -602,17 +418,13 @@ jobs:
             .meter-seg.on { background: var(--amber); }
             .meter-val { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--ivory); width: 38px; text-align: right; flex-shrink: 0; }
             .hw-line { font-family: 'JetBrains Mono', monospace; font-size: 10.5px; color: var(--dust-dim); line-height: 1.6; margin-bottom: 10px; }
-
             .rack-footer { margin-top: auto; padding: 14px 18px; display: flex; flex-direction: column; gap: 8px; }
             .status-line { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--dust); }
             .status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--dust-dim); flex-shrink: 0; }
             .status-dot.ok { background: var(--signal); box-shadow: 0 0 5px var(--signal); }
             .status-dot.bad { background: var(--alert); box-shadow: 0 0 5px var(--alert); }
             .token-line { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--dust-dim); }
-
-            /* ---------- Main viewport ---------- */
             .viewport { flex: 1; display: flex; flex-direction: column; height: 100vh; position: relative; min-width: 0; }
-
             .topbar {
               display: none; align-items: center; gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--rule);
               flex-shrink: 0;
@@ -622,7 +434,6 @@ jobs:
               border-radius: var(--radius-s); cursor: pointer; font-size: 15px;
             }
             .topbar-title { font-family: 'Space Grotesk', sans-serif; font-size: 14px; font-weight: 600; }
-
             .activity-bar {
               padding: 7px 24px; font-size: 12px; color: var(--amber); display: none; align-items: center; gap: 9px;
               font-family: 'JetBrains Mono', monospace; border-bottom: 1px solid var(--rule); flex-shrink: 0;
@@ -632,10 +443,8 @@ jobs:
               animation: pulse 1s ease-in-out infinite;
             }
             @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
-
             .log { flex: 1; overflow-y: auto; padding: 8px 0 160px; }
             .log-inner { max-width: 680px; margin: 0 auto; padding: 0 20px; }
-
             .turn { padding: 20px 0; border-bottom: 1px solid var(--rule); }
             .turn:last-child { border-bottom: none; }
             .turn-label {
@@ -656,11 +465,9 @@ jobs:
             .turn.error .turn-body { color: var(--alert); }
             .cursor-blink { display: inline-block; width: 7px; height: 14px; background: var(--amber); vertical-align: -2px; animation: blink 0.9s step-end infinite; margin-left: 2px; }
             @keyframes blink { 50% { opacity: 0; } }
-
             .empty-state { max-width: 480px; margin: 60px auto; text-align: center; padding: 0 20px; }
             .empty-state h2 { font-family: 'Space Grotesk', sans-serif; font-size: 18px; font-weight: 600; margin-bottom: 8px; }
             .empty-state p { color: var(--dust); font-size: 13.5px; line-height: 1.6; }
-
             .media-row { display: flex; gap: 8px; padding: 0 16px 8px; flex-wrap: wrap; }
             .media-chip {
               position: relative; width: 54px; height: 54px; border-radius: var(--radius-s); overflow: hidden;
@@ -671,7 +478,6 @@ jobs:
               position: absolute; top: 2px; right: 2px; background: rgba(0,0,0,0.75); color: #fff;
               border: none; border-radius: 3px; width: 16px; height: 16px; font-size: 10px; cursor: pointer; line-height: 1;
             }
-
             .dock-wrap {
               position: absolute; bottom: 0; left: 0; width: 100%;
               background: linear-gradient(180deg, transparent 0%, var(--ink) 45%);
@@ -689,7 +495,6 @@ jobs:
             }
             .dock textarea::placeholder { color: var(--dust-dim); }
             .dock textarea:disabled { color: var(--dust-dim); }
-
             .icon-btn, .send-btn, .stop-btn {
               border: 1px solid var(--rule-bright); border-radius: var(--radius-s); width: 34px; height: 34px;
               display: flex; align-items: center; justify-content: center; cursor: pointer; flex-shrink: 0; font-size: 15px;
@@ -700,10 +505,7 @@ jobs:
             .send-btn:hover { background: #f0b25a; }
             .send-btn:disabled { background: var(--panel-raised); border-color: var(--rule); color: var(--dust-dim); cursor: not-allowed; }
             .stop-btn { background: var(--alert-dim); border-color: var(--alert); color: var(--alert); display: none; }
-
             .dock-hint { font-family: 'JetBrains Mono', monospace; font-size: 10.5px; color: var(--dust-dim); margin-top: 8px; }
-
-            /* ---------- Download modal ---------- */
             .modal-overlay {
               position: fixed; inset: 0; background: rgba(10,9,7,0.82); backdrop-filter: blur(6px);
               display: none; align-items: center; justify-content: center; z-index: 100; padding: 20px;
@@ -715,31 +517,24 @@ jobs:
             .modal-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
             .modal-name { font-family: 'JetBrains Mono', monospace; font-size: 14px; color: var(--ivory); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
             .modal-pct { font-family: 'JetBrains Mono', monospace; font-size: 16px; font-weight: 600; color: var(--amber); flex-shrink: 0; }
-
             .metric-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
             .metric { background: var(--panel-raised); border: 1px solid var(--rule); border-radius: var(--radius-s); padding: 8px 10px; }
             .metric-label { font-size: 10px; color: var(--dust-dim); margin-bottom: 3px; }
             .metric-val { font-family: 'JetBrains Mono', monospace; font-size: 12.5px; color: var(--ivory); }
-
             .modal-bar-track { width: 100%; height: 6px; background: var(--rule); border-radius: 3px; overflow: hidden; }
             .modal-bar-fill { height: 100%; background: var(--amber); width: 0%; transition: width 0.25s ease-out; }
-
             .term { background: #0e0d0b; border: 1px solid var(--rule); border-radius: var(--radius-s); padding: 10px 12px;
               height: 120px; overflow-y: auto; font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #94a3b8; line-height: 1.6; }
             .term-line.error { color: var(--alert); font-weight: 600; }
-
             .modal-btn {
               align-self: flex-end; background: transparent; border: 1px solid var(--rule-bright); color: var(--ivory);
               padding: 7px 16px; border-radius: var(--radius-s); cursor: pointer; font-size: 12.5px; font-weight: 500;
             }
             .modal-btn:hover:not(:disabled) { border-color: var(--amber-line); color: var(--amber); }
             .modal-btn:disabled { opacity: 0.5; cursor: not-allowed; }
-
             .backdrop-scrim {
               position: fixed; inset: 0; background: rgba(10,9,7,0.6); z-index: 25; display: none;
             }
-
-            /* ---------- Responsive ---------- */
             @media (max-width: 860px) {
               .rack {
                 position: fixed; top: 0; left: 0; height: 100%; transform: translateX(-100%); box-shadow: 0 0 40px rgba(0,0,0,0.5);
@@ -752,9 +547,7 @@ jobs:
           </style>
           </head>
           <body>
-
             <div class="backdrop-scrim" id="scrim"></div>
-
             <div class="modal-overlay" id="downloadModal">
               <div class="modal-box">
                 <div class="modal-head">
@@ -771,7 +564,6 @@ jobs:
                 <button class="modal-btn" id="modalCloseBtn" disabled>Downloading…</button>
               </div>
             </div>
-
             <nav class="rack" id="rack">
               <div class="rack-header">
                 <div class="rack-mark">🦙</div>
@@ -781,11 +573,9 @@ jobs:
                 </div>
                 <button class="rack-close" id="rackClose" aria-label="Close model panel">✕</button>
               </div>
-
               <div class="module">
                 <button class="new-session-btn" id="newSessionBtn">＋ New session</button>
               </div>
-
               <div class="module">
                 <div class="module-label">
                   <span>Models</span>
@@ -795,7 +585,6 @@ jobs:
                   <div class="model-list-empty">Reading model catalog…</div>
                 </div>
               </div>
-
               <div class="module">
                 <div class="field">
                   <div class="field-row"><span>Temperature</span><span class="val" id="tempVal">0.7</span></div>
@@ -806,7 +595,6 @@ jobs:
                   <input type="range" id="maxTokens" min="128" max="4096" step="128" value="2048" aria-label="Max tokens">
                 </div>
               </div>
-
               <div class="module">
                 <div class="module-label"><span>Hardware</span></div>
                 <div class="hw-line" id="sysSpecs">reading host specs…</div>
@@ -826,28 +614,23 @@ jobs:
                   <span class="meter-val" id="diskFreeVal" style="width:auto;">—</span>
                 </div>
               </div>
-
               <div class="rack-footer">
                 <div class="status-line"><span class="status-dot" id="engineDot"></span><span id="engineText">Checking engine…</span></div>
                 <div class="token-line" id="tokenCounter">0 tokens generated</div>
               </div>
             </nav>
-
             <div class="viewport">
               <div class="topbar">
                 <button class="topbar-toggle" id="rackOpenBtn" aria-label="Open model panel">☰</button>
                 <span class="topbar-title" id="topbarModel">No model selected</span>
               </div>
-
               <div class="activity-bar" id="activityBar">
                 <span class="activity-dot"></span>
                 <span id="activityText">Idle</span>
               </div>
-
               <div class="log" id="log">
                 <div class="log-inner" id="logInner"></div>
               </div>
-
               <div class="dock-wrap">
                 <div class="media-row" id="mediaRow"></div>
                 <div class="dock">
@@ -860,10 +643,8 @@ jobs:
                 <div class="dock-hint">Enter to send · Shift+Enter for a new line</div>
               </div>
             </div>
-
           <script>
             marked.setOptions({ gfm: true, breaks: true });
-
             const $ = (id) => document.getElementById(id);
             const logInner = $('logInner');
             const logEl = $('log');
@@ -884,7 +665,6 @@ jobs:
             const engineText = $('engineText');
             const rack = $('rack');
             const scrim = $('scrim');
-
             const downloadModal = $('downloadModal');
             const modalTitle = $('modalTitle');
             const modalBar = $('modalBar');
@@ -931,14 +711,12 @@ jobs:
               container.innerHTML = html;
             }
 
-            // ---------- Sidebar drawer (mobile) ----------
             function openRack() { rack.classList.add('open'); scrim.classList.add('show'); }
             function closeRack() { rack.classList.remove('open'); scrim.classList.remove('show'); }
             $('rackOpenBtn').addEventListener('click', openRack);
             $('rackClose').addEventListener('click', closeRack);
             scrim.addEventListener('click', closeRack);
 
-            // ---------- Attach / media ----------
             attachBtn.addEventListener('click', () => mediaInput.click());
             mediaInput.addEventListener('change', (event) => {
               const file = event.target.files[0];
@@ -962,7 +740,6 @@ jobs:
               mediaInput.value = '';
             }
 
-            // ---------- Host telemetry ----------
             async function fetchSysInfo() {
               try {
                 const r = await fetch('/api/sysinfo');
@@ -982,7 +759,7 @@ jobs:
                 $('ramVal').textContent = data.ram_percent.toFixed(0) + '%';
                 renderMeterSegments($('ramMeter'), data.ram_percent, 20);
                 $('diskFreeVal').textContent = data.disk_free;
-              } catch (e) { /* transient — leave last known values on screen */ }
+              } catch (e) {}
             }
 
             async function pollHealth() {
@@ -1006,7 +783,6 @@ jobs:
             setInterval(fetchStats, 3000);
             setInterval(pollHealth, 8000);
 
-            // ---------- Model list (event-delegated, no inline handlers) ----------
             async function loadModels() {
               try {
                 const resp = await fetch('/api/models');
@@ -1021,7 +797,7 @@ jobs:
                 }
                 updateComposerState();
               } catch (e) {
-                modelListContainer.innerHTML = '<div class="model-list-empty">Could not reach the engine. Check that Ollama is running, then hit refresh.</div>';
+                modelListContainer.innerHTML = '<div class="model-list-empty">Could not reach engine. Hit refresh.</div>';
               }
             }
 
@@ -1073,7 +849,7 @@ jobs:
               userInput.disabled = !ready;
               sendButton.disabled = !ready;
               userInput.placeholder = ready
-                ? 'Ask a question, or attach an image for a vision model…'
+                ? 'Ask a question, or attach an image...'
                 : 'Download a model from the panel to begin…';
               if (!ready) {
                 renderEmptyLog();
@@ -1085,11 +861,10 @@ jobs:
               logInner.innerHTML = `
                 <div class="empty-state">
                   <h2>No model loaded yet</h2>
-                  <p>Pick a model in the panel and hit "Pull" to download it, then select it to start a session. Vision-tagged models accept an attached image; none of these models can generate images.</p>
+                  <p>Pick a model in the panel and hit "Pull" to download it, then select it to start a session.</p>
                 </div>`;
             }
 
-            // ---------- Model download ----------
             function appendTerminalLog(msg, type = '') {
               const line = document.createElement('div');
               line.className = 'term-line' + (type ? ' ' + type : '');
@@ -1146,10 +921,7 @@ jobs:
                         modalBar.style.width = data.percent + '%';
                         modalPercent.textContent = data.percent + '%';
                       }
-                      if (data.speed) metricSpeed.textContent = data.speed;
-                      if (data.size) metricSize.textContent = data.size;
-                      if (data.eta) metricEta.textContent = data.eta;
-                    } catch (e) { /* ignore malformed keepalive frames */ }
+                    } catch (e) {}
                   }
                 }
 
@@ -1162,14 +934,13 @@ jobs:
                   loadModels();
                 }
               } catch (err) {
-                appendTerminalLog('Connection lost during download: ' + err.message, 'error');
+                appendTerminalLog('Connection lost: ' + err.message, 'error');
                 modalCloseBtn.disabled = false;
                 modalCloseBtn.textContent = 'Close';
                 modalCloseBtn.onclick = closeModal;
               }
             }
 
-            // ---------- Chat log ----------
             function appendTurn(role, htmlContent, isLoading, isError) {
               const turn = document.createElement('div');
               turn.className = `turn ${role}` + (isError ? ' error' : '');
@@ -1198,9 +969,7 @@ jobs:
             }
             $('newSessionBtn').addEventListener('click', newSession);
 
-            function stopGenerating() {
-              if (controller) controller.abort();
-            }
+            function stopGenerating() { if (controller) controller.abort(); }
             stopButton.addEventListener('click', stopGenerating);
 
             async function sendMessage() {
@@ -1209,7 +978,7 @@ jobs:
               if (!text && !attachedMediaBase64) return;
 
               let displayHtml = escapeHtml(text).replace(/\n/g, '<br>');
-              const userMessageObj = { role: 'user', content: text };
+              let userMessageObj = { role: 'user', content: text };
 
               if (attachedMediaBase64) {
                 userMessageObj.images = [attachedMediaBase64];
@@ -1260,13 +1029,12 @@ jobs:
                     if (line.slice(6) === '[DONE]') continue;
                     try {
                       const parsed = JSON.parse(line.slice(6));
-                      if (parsed.activity) setActivity(parsed.activity);
                       if (parsed.error) streamError = parsed.error;
                       else if (parsed.content) {
                         fullContent += parsed.content;
                         updateLastAssistantTurn(fullContent, false);
                       }
-                    } catch (e) { /* ignore malformed keepalive frames */ }
+                    } catch (e) {}
                   }
                 }
 
@@ -1279,7 +1047,7 @@ jobs:
               } catch (error) {
                 setActivity(null);
                 const aborted = error.name === 'AbortError';
-                updateLastAssistantTurn(aborted ? '_Generation stopped._' : `Error: ${error.message || 'the request failed.'}`, true);
+                updateLastAssistantTurn(aborted ? '_Generation stopped._' : `Error: ${error.message || 'request failed.'}`, true);
               }
 
               sendButton.style.display = 'flex';
@@ -1307,62 +1075,72 @@ jobs:
           </script>
           </body>
           </html>
-          '''
-
-          if __name__ == "__main__":
-              uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
           PYEOF
           echo "✅ Server script written"
-          python3 -c "import ast; ast.parse(open('ollama_server.py').read())" && echo "✅ Python syntax OK"
 
       - name: 🌐 Start web server
         run: |
+          echo "──────────────────────────────────────────"
+          echo " 🌐  Starting web UI"
+          echo "──────────────────────────────────────────"
           nohup python ollama_server.py > /tmp/webui.log 2>&1 &
           echo $! > /tmp/webui.pid
-          echo "⏳ Waiting for web UI to report healthy..."
           ready=false
-          for i in $(seq 1 20); do
-            if curl -sf "http://127.0.0.1:${PORT}/api/health" > /dev/null 2>&1; then
-              echo "✅ Web UI is live!"
+          for i in $(seq 1 15); do
+            if curl -sf "http://localhost:${PORT}" > /dev/null 2>&1; then
+              echo "✅ Web UI is ready!"
               ready=true
               break
             fi
-            sleep 1
+            sleep 2
           done
           if [ "$ready" != "true" ]; then
             echo "❌ Web UI failed to start. Last logs:"
-            tail -n 80 /tmp/webui.log || true
+            tail -n 50 /tmp/webui.log || true
             exit 1
           fi
 
       - name: 📦 Install cloudflared
         run: |
-          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz -o /tmp/cloudflared.tgz
-          tar -xzf /tmp/cloudflared.tgz -C /tmp
-          sudo mv /tmp/cloudflared /usr/local/bin/cloudflared
-          sudo chmod +x /usr/local/bin/cloudflared
-          rm -f /tmp/cloudflared.tgz
+          curl -L -s https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          chmod +x cloudflared
+          sudo mv cloudflared /usr/local/bin/
+          cloudflared --version
 
       - name: 🌐 Create tunnel and wait
         run: |
+          echo "──────────────────────────────────────────"
+          echo " 🌐  Creating Cloudflare tunnel"
+          echo "──────────────────────────────────────────"
           cloudflared tunnel --url "http://127.0.0.1:${PORT}" --protocol http2 > tunnel.log 2>&1 &
           TUNNEL_PID=$!
+          echo "⏳ Waiting for tunnel URL..."
           TUNNEL_URL=""
           for i in $(seq 1 30); do
             TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log 2>/dev/null | head -1)
             [ -n "$TUNNEL_URL" ] && break
             sleep 2
           done
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "❌ Could not get a tunnel URL. Tunnel log:"
+            cat tunnel.log
+            exit 1
+          fi
           echo ""
           echo "╔═══════════════════════════════════════════════════════════════════╗"
-          echo "║       🎉  Y O U R   S T U D I O   I S   R E A D Y  🎉             ║"
+          echo "║                🎉  Y O U R   L L M   I S   R E A D Y  🎉          ║"
           echo "╠═══════════════════════════════════════════════════════════════════╣"
           echo "║  🔗  $TUNNEL_URL"
           echo "╚═══════════════════════════════════════════════════════════════════╝"
           {
-            echo "## 🦙 Your Local Studio console is live"
+            echo "## 🦙 Your LLM web UI is live"
             echo ""
             echo "**URL:** $TUNNEL_URL"
+            echo ""
+            echo "**Catalog Models:** 24+ On-demand downloadable models"
+            echo "**Context:** ${CONTEXT_SIZE} tokens"
+            echo ""
+            echo "> Models start un-pulled by design and can be downloaded instantly via the sidebar interface on demand."
           } >> "$GITHUB_STEP_SUMMARY"
           wait "$TUNNEL_PID"
 
