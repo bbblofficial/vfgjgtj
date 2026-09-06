@@ -87,8 +87,7 @@ jobs:
 
       - name: 🔧 Write the web server (Glassmorphism UI)
         run: |
-          python3 - << 'EOF'
-          server_code = r'''#!/usr/bin/env python3
+          cat << 'PYEOF' > ollama_server.py
           import json
           import os
           import logging
@@ -288,7 +287,7 @@ jobs:
                   yield "data: [DONE]\n\n"
               return StreamingResponse(generate(), media_type="text/event-stream")
 
-          HTML_TEMPLATE = r'''<!DOCTYPE html>
+          HTML_TEMPLATE = """<!DOCTYPE html>
           <html lang="en">
           <head>
           <meta charset="UTF-8">
@@ -1072,12 +1071,12 @@ jobs:
           </script>
           </body>
           </html>
-          '''
+          """
 
-          with open('ollama_server.py', 'w', encoding='utf-8') as f:
-              f.write(server_code)
-          print("✅ Server script written safely")
-          EOF
+          if __name__ == "__main__":
+              uvicorn.run(app, host="0.0.0.0", PORT, log_level="info")
+          PYEOF
+          echo "✅ Server script written successfully"
 
       - name: 🌐 Start web server
         run: |
