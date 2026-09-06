@@ -61,7 +61,7 @@ jobs:
 
           pip install --no-cache-dir \
             fastapi uvicorn aiohttp httpx python-multipart \
-            jinja2 websockets pydantic psutil mlx
+            jinja2 websockets pydantic psutil
 
           /usr/local/bin/ollama --version
 
@@ -76,10 +76,10 @@ jobs:
           export OLLAMA_MAX_LOADED_MODELS=1
           export OLLAMA_NUM_PARALLEL=1
           export OLLAMA_FLASH_ATTENTION=1
-          
+
           nohup /Applications/Ollama.app/Contents/Resources/ollama serve > /tmp/ollama.log 2>&1 &
           echo $! > /tmp/ollama.pid
-          
+
           echo "⏳ Waiting for Ollama engine to report healthy..."
           ready=false
           for i in $(seq 1 30); do
@@ -90,7 +90,7 @@ jobs:
             fi
             sleep 2
           done
-          
+
           if [ "$ready" != "true" ]; then
             echo "❌ Ollama failed to start. Last logs:"
             tail -n 50 /tmp/ollama.log || true
@@ -108,17 +108,14 @@ jobs:
           import json
           import os
           import re
-          import glob
-          import base64
           import logging
           import platform
-          import subprocess
           import asyncio
           import psutil
-          from typing import Optional, List
+          from typing import Optional
           import httpx
           import uvicorn
-          from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+          from fastapi import FastAPI, HTTPException
           from fastapi.responses import HTMLResponse, StreamingResponse
           from pydantic import BaseModel
 
@@ -131,6 +128,11 @@ jobs:
 
           app = FastAPI(title="Local Studio (Pro)")
 
+          # NOTE: Ollama only runs text / vision-input GGUF models — it has no
+          # text-to-image or text-to-video capability. Models below marked
+          # "vision" accept an uploaded image as INPUT (via the `images` field)
+          # and return TEXT (a description, OCR output, etc). None of them
+          # produce a generated picture as output.
           CATALOG_MODELS = [
               "llama3.2:3b",
               "llama3.2:1b",
@@ -140,15 +142,16 @@ jobs:
               "deepseek-r1:1.5b",
               "gemma2:2b",
               "tinyllama",
-              "x/flux2-klein:latest",
-              "deepseek-ocr:latest"
+              "llava:7b",
+              "qwen2.5vl:3b",
+              "deepseek-ocr:latest",
           ]
 
-          IMAGE_MODEL_PREFIXES = ("x/z-image", "x/flux", "flux", "stable-diffusion")
+          VISION_MODEL_PREFIXES = ("llava", "qwen2.5vl", "qwen2-vl", "deepseek-ocr", "bakllava", "moondream")
 
-          def is_image_model(model_name: str) -> bool:
+          def is_vision_model(model_name: str) -> bool:
               m = model_name.lower()
-              return any(p in m for p in IMAGE_MODEL_PREFIXES)
+              return any(p in m for p in VISION_MODEL_PREFIXES)
 
           def clean_ansi(text: str) -> str:
               ansi_escape = re.compile(r'(?:\x1B[@-_]|[\x80-\x9F])[0-?]*[ -/]*[@-~]')
@@ -205,20 +208,20 @@ jobs:
                       data = r.json()
                       downloaded_raw = [m["name"] for m in data.get("models", [])]
                       downloaded = set(downloaded_raw)
-                      
+
                       for m in downloaded_raw:
                           if m.endswith(":latest"):
                               downloaded.add(m[:-7])
                           else:
                               downloaded.add(f"{m}:latest")
-                      
+
                       all_models = list(dict.fromkeys(downloaded_raw + CATALOG_MODELS))
                       result = []
                       for m in all_models:
                           result.append({
                               "name": m,
                               "downloaded": m in downloaded,
-                              "type": "image" if is_image_model(m) else "text"
+                              "type": "vision" if is_vision_model(m) else "text"
                           })
                       return {"models": result}
               except Exception as exc:
@@ -230,19 +233,19 @@ jobs:
                   cmd = ["/Applications/Ollama.app/Contents/Resources/ollama", "pull", request.model]
                   env = os.environ.copy()
                   env["OLLAMA_MODELS"] = "/Users/runner/ollama_models"
-                  
+
                   proc = await asyncio.create_subprocess_exec(
                       *cmd,
                       stdout=asyncio.subprocess.PIPE,
                       stderr=asyncio.subprocess.STDOUT,
                       env=env
                   )
-                  
+
                   pct_pattern = re.compile(r'(\d+)%')
                   speed_pattern = re.compile(r'([0-9\.]+\s*(?:KB|MB|GB)/s)')
                   size_pattern = re.compile(r'([0-9\.]+\s*(?:KB|MB|GB)\s*/\s*[0-9\.]+\s*(?:KB|MB|GB))')
                   eta_pattern = re.compile(r'(\d+[m|s]\w*)')
-                  
+
                   buffer = ""
                   try:
                       while True:
@@ -250,17 +253,17 @@ jobs:
                           if not chunk:
                               break
                           buffer += chunk.decode('utf-8', errors='ignore')
-                          
+
                           while '\r' in buffer or '\n' in buffer:
                               delim = '\r' if '\r' in buffer else '\n'
                               part, buffer = buffer.split(delim, 1)
                               cleaned = clean_ansi(part)
                               if not cleaned:
                                   continue
-                              
+
                               pct_match = pct_pattern.search(cleaned)
                               pct = int(pct_match.group(1)) if pct_match else None
-                              
+
                               msg = {
                                   "raw": cleaned,
                                   "percent": pct,
@@ -269,7 +272,7 @@ jobs:
                                   "eta": eta_pattern.search(cleaned).group(1) if eta_pattern.search(cleaned) else ""
                               }
                               yield f"data: {json.dumps(msg)}\n\n"
-                      
+
                       await proc.wait()
                       if proc.returncode == 0:
                           yield f"data: {json.dumps({'status': 'Completed successfully!', 'percent': 100})}\n\n"
@@ -277,11 +280,11 @@ jobs:
                           yield f"data: {json.dumps({'error': f'Pull process failed with exit code {proc.returncode}'})}\n\n"
                   except Exception as e:
                       yield f"data: {json.dumps({'error': str(e)})}\n\n"
-                  
+
                   yield "data: [DONE]\n\n"
 
               return StreamingResponse(
-                  generate(), 
+                  generate(),
                   media_type="text/event-stream",
                   headers={"Cache-Control": "no-cache", "Connection": "keep-alive"}
               )
@@ -294,49 +297,22 @@ jobs:
           async def chat(request: ChatRequest):
               async def generate():
                   try:
-                      # ارسال وضعیت زنده به کاربر قبل از شروع پردازش
                       yield f"data: {json.dumps({'activity': 'Initializing inference engine & loading weights into Unified Memory...'})}\n\n"
                       await asyncio.sleep(0.1)
 
-                      # مدیریت مدل‌های تصویری
-                      if is_image_model(request.model):
-                          prompt = request.messages[-1]["content"] if request.messages else ""
-                          yield f"data: {json.dumps({'activity': f'🎨 Synthesizing image prompt with {request.model} (This may take a moment)...'})}\n\n"
-
-                          before_files = set(glob.glob("*.png") + glob.glob("*.jpg") + glob.glob("*.jpeg") + glob.glob("*.mp4"))
-                          
-                          cmd = ["/Applications/Ollama.app/Contents/Resources/ollama", "run", request.model, prompt]
-                          process = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-                          
-                          after_files = set(glob.glob("*.png") + glob.glob("*.jpg") + glob.glob("*.jpeg") + glob.glob("*.mp4"))
-                          new_files = list(after_files - before_files)
-                          
-                          if new_files:
-                              latest_file = new_files[-1]
-                              with open(latest_file, "rb") as f:
-                                  b64_data = base64.b64encode(f.read()).decode("utf-8")
-                              
-                              if latest_file.endswith(".mp4"):
-                                  media_tag = f"<video controls autoplay style='max-width:100%; border-radius:12px;'><source src='data:video/mp4;base64,{b64_data}' type='video/mp4'></video><br>*Generated Video: `{latest_file}`*"
-                              else:
-                                  media_tag = f"![Generated Image](data:image/png;base64,{b64_data})\\n\\n*Generated Image: `{latest_file}`*"
-                              
-                              yield f"data: {json.dumps({'content': media_tag, 'activity': 'Ready'})}\n\n"
-                          elif process.stdout:
-                              yield f"data: {json.dumps({'content': clean_ansi(process.stdout), 'activity': 'Ready'})}\n\n"
-                          else:
-                              yield f"data: {json.dumps({'content': 'Media generation completed.', 'activity': 'Ready'})}\n\n"
-
-                          yield "data: [DONE]\n\n"
-                          return
-
-                      # مدیریت چت متنی و چندرسانه‌ای با تصاویر آپلود شده
+                      # All models here are text-generation (or vision-input/text-output)
+                      # models served through Ollama's native /api/chat endpoint.
+                      # Images the user attaches are passed through as `images`
+                      # on the message; Ollama does not generate images/video.
                       ollama_messages = []
                       for m in request.messages:
                           msg_dict = {"role": m["role"], "content": m["content"]}
                           if "images" in m and m["images"]:
                               msg_dict["images"] = m["images"]
                           ollama_messages.append(msg_dict)
+
+                      if "images" in (request.messages[-1] if request.messages else {}) and not is_vision_model(request.model):
+                          yield f"data: {json.dumps({'activity': 'Warning: selected model has no vision support, image will be ignored...'})}\n\n"
 
                       yield f"data: {json.dumps({'activity': f'Generating response using {request.model}...'})}\n\n"
 
@@ -360,7 +336,7 @@ jobs:
                                   yield f"data: {json.dumps({'error': clean_ansi(body.decode(errors='ignore'))})}\n\n"
                                   yield "data: [DONE]\n\n"
                                   return
-                              
+
                               yield f"data: {json.dumps({'activity': 'Streaming response tokens...'})}\n\n"
                               async for line in response.aiter_lines():
                                   line = line.strip()
@@ -389,16 +365,16 @@ jobs:
           <meta charset="UTF-8">
           <meta name="viewport" content="width=device-width, initial-scale=1.0">
           <title>Local Studio (Pro Multimodal)</title>
-          
+
           <link rel="preconnect" href="https://fonts.googleapis.com">
           <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
           <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Vazirmatn:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-          
+
           <script src="https://cdn.jsdelivr.net/npm/marked@4.3.0/marked.min.js"></script>
           <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.6/purify.min.js"></script>
           <link id="hljsTheme" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css">
           <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
-          
+
           <style>
             :root {
               --bg: #09090b;
@@ -448,11 +424,11 @@ jobs:
               font-size: 13px; font-weight: 500; cursor: pointer; margin-bottom: 18px; transition: all 0.2s ease;
             }
             .new-chat-btn:hover { border-color: var(--accent); box-shadow: 0 0 15px var(--accent-glow); color: #fff; }
-            
+
             .settings-group { display: flex; flex-direction: column; gap: 14px; font-size: 13px; color: var(--text-secondary); }
             .settings-group label { display: flex; justify-content: space-between; align-items: center; font-size: 12px; font-weight: 500; }
             .settings-group input[type="range"] { width: 100%; accent-color: var(--cyan); margin-top: 5px; }
-            
+
             .model-section-title {
               font-weight: 600; color: var(--text); font-size: 12px; text-transform: uppercase;
               letter-spacing: 0.5px; display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;
@@ -471,7 +447,7 @@ jobs:
             .model-name { font-weight: 500; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 155px; }
             .model-badges { display: flex; align-items: center; gap: 5px; }
             .model-type-badge { font-size: 9px; padding: 1px 5px; border-radius: 4px; font-weight: 600; text-transform: uppercase; }
-            .model-type-badge.image { background: rgba(168, 85, 247, 0.18); color: #c084fc; border: 1px solid rgba(168, 85, 247, 0.3); }
+            .model-type-badge.vision { background: rgba(168, 85, 247, 0.18); color: #c084fc; border: 1px solid rgba(168, 85, 247, 0.3); }
             .model-type-badge.text { background: rgba(6, 182, 212, 0.15); color: #38bdf8; border: 1px solid rgba(6, 182, 212, 0.3); }
             .model-status { font-size: 10px; font-weight: 500; }
             .model-status.ready { color: var(--ok); }
@@ -493,7 +469,7 @@ jobs:
             #sysSpecs { color: var(--text-muted); font-size: 11px; line-height: 1.4; border-bottom: 1px solid rgba(255,255,255,0.05); padding-bottom: 6px; }
             .progress-bar { width: 100%; height: 5px; background: rgba(255,255,255,0.08); border-radius: 3px; overflow: hidden; margin-top: 3px; }
             .progress-fill { height: 100%; transition: width 0.3s ease; }
-            
+
             .sidebar-footer {
               margin-top: auto; border-top: 1px solid var(--border); padding-top: 14px;
               font-size: 12px; color: var(--text-secondary); display: flex; flex-direction: column; gap: 8px;
@@ -506,10 +482,9 @@ jobs:
             .status-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; }
             .status-dot.ok { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
             .status-dot.bad { background: var(--danger); box-shadow: 0 0 8px var(--danger); }
-            
+
             .main-content { flex: 1; display: flex; flex-direction: column; height: 100vh; position: relative; }
-            
-            /* Live Activity Header Banner */
+
             .live-activity-bar {
               background: rgba(6, 182, 212, 0.08); border-bottom: 1px solid rgba(6, 182, 212, 0.2);
               padding: 8px 24px; font-size: 12px; color: var(--cyan); display: flex; align-items: center; gap: 10px;
@@ -522,7 +497,7 @@ jobs:
             @keyframes spin { to { transform: rotate(360deg); } }
 
             .chat-container { flex: 1; overflow-y: auto; display: flex; flex-direction: column; padding: 20px 0 150px 0; scroll-behavior: smooth; }
-            
+
             .message-row {
               width: 100%; display: flex; justify-content: center; padding: 22px 20px;
               border-bottom: 1px solid rgba(255,255,255,0.02); animation: fadeIn 0.25s ease-out;
@@ -530,7 +505,7 @@ jobs:
             @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
             .message-row.user { background: var(--user-bg); }
             .message-row.error .message-body { color: var(--danger); }
-            
+
             .message-inner { max-width: 820px; width: 100%; display: flex; gap: 16px; line-height: 1.7; font-size: 15px; }
             .avatar {
               width: 32px; height: 32px; border-radius: 8px; display: flex; align-items: center; justify-content: center;
@@ -538,7 +513,7 @@ jobs:
             }
             .avatar.user { background: linear-gradient(135deg, var(--cyan), #0284c7); box-shadow: 0 2px 10px rgba(6, 182, 212, 0.3); }
             .avatar.assistant { background: linear-gradient(135deg, var(--accent), #059669); box-shadow: 0 2px 10px rgba(16, 185, 129, 0.3); }
-            
+
             .message-body { flex: 1; overflow-x: auto; min-width: 0; padding-top: 3px; }
             .message-body p { margin: 0 0 14px; }
             .message-body p:last-child { margin-bottom: 0; }
@@ -549,8 +524,7 @@ jobs:
             }
             .message-body code { font-family: 'JetBrains Mono', monospace; font-size: 13px; background: rgba(255,255,255,0.08); padding: 2px 5px; border-radius: 4px; }
             .message-body pre code { background: transparent; padding: 0; }
-            
-            /* Media Preview Thumbnail inside Input */
+
             .media-preview-container {
               display: flex; gap: 8px; padding: 0 16px 8px 16px; flex-wrap: wrap;
             }
@@ -582,7 +556,7 @@ jobs:
               font-size: 14.5px; resize: none; outline: none; max-height: 200px; min-height: 26px; line-height: 26px;
             }
             .input-box textarea::placeholder { color: var(--text-muted); }
-            
+
             .upload-btn-label {
               background: rgba(255,255,255,0.06); border: 1px solid var(--border); border-radius: 10px;
               width: 38px; height: 38px; display: flex; align-items: center; justify-content: center;
@@ -598,7 +572,7 @@ jobs:
             .stop-btn { background: var(--danger); display: none; box-shadow: 0 2px 10px rgba(239, 68, 68, 0.3); }
             .send-btn:hover { background: #059669; }
             .stop-btn:hover { background: #dc2626; }
-            
+
             .modal-overlay {
               position: fixed; inset: 0; background: rgba(0,0,0,0.85); backdrop-filter: blur(10px);
               display: none; align-items: center; justify-content: center; z-index: 100;
@@ -610,7 +584,7 @@ jobs:
             }
             .modal-header { display: flex; justify-content: space-between; align-items: center; }
             .modal-title { font-size: 15px; font-weight: 600; color: #fff; display: flex; align-items: center; gap: 8px; }
-            
+
             .metric-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
             .metric-card {
               background: rgba(0,0,0,0.4); border: 1px solid var(--border); border-radius: 10px;
@@ -618,12 +592,12 @@ jobs:
             }
             .metric-label { font-size: 10px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; }
             .metric-val { font-family: 'JetBrains Mono', monospace; font-size: 13px; font-weight: 600; color: var(--cyan); }
-            
+
             .dl-bar-container { display: flex; flex-direction: column; gap: 6px; }
             .dl-modal-bar { width: 100%; height: 7px; background: rgba(255,255,255,0.08); border-radius: 4px; overflow: hidden; }
             .dl-modal-fill { height: 100%; background: linear-gradient(90deg, var(--cyan), var(--accent)); width: 0%; transition: width 0.25s ease-out; }
             .dl-bar-info { display: flex; justify-content: space-between; font-size: 12px; color: var(--text-secondary); }
-            
+
             .terminal-container {
               background: #09090b; border: 1px solid var(--border); border-radius: 10px;
               padding: 12px; height: 130px; overflow-y: auto; font-family: 'JetBrains Mono', monospace;
@@ -632,7 +606,7 @@ jobs:
             .terminal-line { word-break: break-all; }
             .terminal-line.success { color: var(--ok); font-weight: 600; }
             .terminal-line.error { color: var(--danger); font-weight: 600; }
-            
+
             .modal-close-btn {
               align-self: flex-end; background: rgba(255,255,255,0.08); border: 1px solid var(--border); color: #fff;
               padding: 8px 20px; border-radius: 8px; cursor: pointer; font-size: 12.5px; font-weight: 500; transition: all 0.2s;
@@ -647,7 +621,7 @@ jobs:
                   <div class="modal-title">📥 <span id="modalTitle">Pulling Model</span></div>
                   <span id="modalPercent" style="font-family:'JetBrains Mono',monospace; font-size:14px; font-weight:700; color:var(--cyan);">0%</span>
                 </div>
-                
+
                 <div class="metric-grid">
                   <div class="metric-card">
                     <span class="metric-label">Speed</span>
@@ -681,7 +655,7 @@ jobs:
               </div>
 
               <button class="new-chat-btn" onclick="clearChat()"><span>＋</span> New Chat</button>
-              
+
               <div class="settings-group">
                 <div class="model-section-title">
                   <span>Model Selector</span>
@@ -695,7 +669,7 @@ jobs:
                   <label>Temperature <span id="tempVal" style="color: var(--cyan); font-family:monospace;">0.7</span></label>
                   <input type="range" id="temperature" min="0" max="2" step="0.1" value="0.7">
                 </div>
-                
+
                 <div>
                   <label>Max Tokens <span id="tokenVal" style="color: var(--cyan); font-family:monospace;">2048</span></label>
                   <input type="range" id="maxTokens" min="128" max="4096" step="128" value="2048">
@@ -705,19 +679,19 @@ jobs:
               <div class="system-stats">
                 <div class="stat-title">🖥️ Server Resources</div>
                 <div id="sysSpecs">Loading hardware...</div>
-                
+
                 <div class="stat-row">
                   <span>CPU Usage:</span>
                   <span id="cpuVal" class="stat-value" style="color: var(--cyan);">0%</span>
                 </div>
                 <div class="progress-bar"><div id="cpuBar" class="progress-fill" style="background: var(--cyan); width: 0%;"></div></div>
-                
+
                 <div class="stat-row" style="margin-top: 4px;">
                   <span>RAM Usage:</span>
                   <span id="ramVal" class="stat-value" style="color: var(--accent);">0%</span>
                 </div>
                 <div class="progress-bar"><div id="ramBar" class="progress-fill" style="background: var(--accent); width: 0%;"></div></div>
-                
+
                 <div class="stat-row" style="margin-top: 4px;">
                   <span>Storage Free:</span>
                   <span id="diskFreeVal" class="stat-value" style="color: var(--ok);">0 GB</span>
@@ -749,11 +723,11 @@ jobs:
               <div class="input-area-wrapper">
                 <div class="media-preview-container" id="mediaPreviewContainer"></div>
                 <div class="input-box">
-                  <label class="upload-btn-label" title="Upload Image or Video">
+                  <label class="upload-btn-label" title="Attach image for vision models (llava, qwen2.5vl, deepseek-ocr)">
                     📎
-                    <input type="file" id="mediaInput" accept="image/*,video/*" style="display:none;" onchange="handleMediaUpload(event)">
+                    <input type="file" id="mediaInput" accept="image/*" style="display:none;" onchange="handleMediaUpload(event)">
                   </label>
-                  <textarea id="userInput" placeholder="Ask a question or upload image/video..." rows="1"></textarea>
+                  <textarea id="userInput" placeholder="Ask a question, or attach an image for a vision model..." rows="1"></textarea>
                   <button class="send-btn" id="sendButton" onclick="sendMessage()">↑</button>
                   <button class="stop-btn" id="stopButton" onclick="stopGenerating()">■</button>
                 </div>
@@ -766,24 +740,21 @@ jobs:
               el.innerHTML = DOMPurify.sanitize(marked.parse(text)) + (opts.loading ? '<span class="loading-dots"></span>' : '');
             }
 
-            const STORE_KEY = 'studio-pro-multimodal-v1';
             const chatContainer = document.getElementById('chatContainer');
             const userInput = document.getElementById('userInput');
             const sendButton = document.getElementById('sendButton');
             const stopButton = document.getElementById('stopButton');
             const tokenCounter = document.getElementById('tokenCounter');
-            const statusIndicator = document.getElementById('statusIndicator');
             const temperatureEl = document.getElementById('temperature');
             const maxTokensEl = document.getElementById('maxTokens');
             const modelListContainer = document.getElementById('modelListContainer');
             const currentModelTag = document.getElementById('currentModelTag');
             const liveActivityBar = document.getElementById('liveActivityBar');
             const liveActivityText = document.getElementById('liveActivityText');
-            
+
             const downloadModal = document.getElementById('downloadModal');
             const modalTitle = document.getElementById('modalTitle');
             const modalBar = document.getElementById('modalBar');
-            const modalStatus = document.getElementById('modalStatus');
             const modalPercent = document.getElementById('modalPercent');
             const modalLogs = document.getElementById('modalLogs');
             const modalCloseBtn = document.getElementById('modalCloseBtn');
@@ -812,7 +783,7 @@ jobs:
                 const previewContainer = document.getElementById('mediaPreviewContainer');
                 previewContainer.innerHTML = `
                   <div class="media-thumb">
-                    ${file.type.startsWith('video') ? `<video src="${e.target.result}"></video>` : `<img src="${e.target.result}">`}
+                    <img src="${e.target.result}">
                     <button class="remove-media" onclick="removeMedia()">×</button>
                   </div>
                 `;
@@ -854,7 +825,7 @@ jobs:
                 const resp = await fetch('/api/models');
                 const data = await resp.json();
                 const models = data.models || [];
-                
+
                 modelListContainer.innerHTML = models.map(m => `
                   <div class="model-item ${m.name === currentModel ? 'active' : ''}" onclick="${m.downloaded ? `selectModel('${m.name}', '${m.type}')` : ''}">
                     <div class="model-meta">
@@ -983,6 +954,10 @@ jobs:
               messageHistory = []; totalTokens = 0;
             }
 
+            function stopGenerating() {
+              if (controller) controller.abort();
+            }
+
             async function sendMessage() {
               if (isStreaming) return;
               const text = userInput.value.trim();
@@ -1003,7 +978,7 @@ jobs:
               removeMedia();
               sendButton.style.display = 'none'; stopButton.style.display = 'flex';
               isStreaming = true; controller = new AbortController();
-              
+
               setActivity("Connecting to engine...");
               appendMessage('assistant', 'Processing request...', true);
 
@@ -1053,8 +1028,25 @@ jobs:
               isStreaming = false; userInput.focus();
             }
 
+            userInput.addEventListener('keydown', function(e) {
+              if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendMessage();
+              }
+            });
+            userInput.addEventListener('input', function() {
+              this.style.height = 'auto';
+              this.style.height = Math.min(this.scrollHeight, 200) + 'px';
+            });
+            temperatureEl.addEventListener('input', function() {
+              document.getElementById('tempVal').textContent = this.value;
+            });
+            maxTokensEl.addEventListener('input', function() {
+              document.getElementById('tokenVal').textContent = this.value;
+            });
+
             loadModels().then(() => {
-              renderInto(document.getElementById('welcomeMsg'), `**System ready.** Attach images/videos or chat with any model.`);
+              renderInto(document.getElementById('welcomeMsg'), `**System ready.** Chat with any downloaded model. Attach an image and pick a vision model (llava, qwen2.5vl, deepseek-ocr) to have it described or read — Ollama does not generate images.`);
             });
           </script>
           </body>
