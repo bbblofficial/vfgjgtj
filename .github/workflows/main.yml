@@ -52,9 +52,9 @@ jobs:
       - name: 📦 Install Ollama Bundle & Python packages
         run: |
           echo "──────────────────────────────────────────"
-          echo " 📦  Installing Ollama Release & Vision Stack"
+          echo " 📦  Installing Ollama Release & Web Stack"
           echo "──────────────────────────────────────────"
-          curl -fsSL https://github.com/ollama/ollama/releases/download/v0.32.5/Ollama-darwin.zip -o /tmp/Ollama-darwin.zip
+          curl -fsSL https://github.com/ollama/ollama/releases/download/v0.33.3/Ollama-darwin.zip -o /tmp/Ollama-darwin.zip
           sudo unzip -q /tmp/Ollama-darwin.zip -d /Applications/
           sudo ln -sf /Applications/Ollama.app/Contents/Resources/ollama /usr/local/bin/ollama
           rm -f /tmp/Ollama-darwin.zip
@@ -101,7 +101,7 @@ jobs:
         run: |
           ollama list
 
-      - name: 🔧 Write the web server (Multimodal & Activity Stream Engine)
+      - name: 🔧 Write the web server (Console UI & Activity Stream Engine)
         run: |
           cat > ollama_server.py << 'PYEOF'
           #!/usr/bin/env python3
@@ -149,9 +149,28 @@ jobs:
 
           VISION_MODEL_PREFIXES = ("llava", "qwen2.5vl", "qwen2-vl", "deepseek-ocr", "bakllava", "moondream")
 
+          # Models known to be prone to crashing their llama-server backend
+          # (SIGABRT / "process has terminated") on constrained or emulated
+          # GPU environments like CI runners. Flagged in the UI so people
+          # aren't left guessing when the abort happens.
+          EXPERIMENTAL_MODEL_PREFIXES = ("deepseek-ocr",)
+
+          # Substrings that show up in Ollama's error body when the underlying
+          # llama-server / MLX subprocess has crashed outright, as opposed to
+          # a normal validation error (bad model name, malformed request, etc).
+          BACKEND_CRASH_MARKERS = ("terminated", "abort trap", "signal:", "exit status")
+
           def is_vision_model(model_name: str) -> bool:
               m = model_name.lower()
               return any(p in m for p in VISION_MODEL_PREFIXES)
+
+          def is_experimental_model(model_name: str) -> bool:
+              m = model_name.lower()
+              return any(p in m for p in EXPERIMENTAL_MODEL_PREFIXES)
+
+          def looks_like_backend_crash(text: str) -> bool:
+              t = text.lower()
+              return any(marker in t for marker in BACKEND_CRASH_MARKERS)
 
           def clean_ansi(text: str) -> str:
               ansi_escape = re.compile(r'(?:\x1B[@-_]|[\x80-\x9F])[0-?]*[ -/]*[@-~]')
@@ -184,8 +203,8 @@ jobs:
               vmem = psutil.virtual_memory()
               return {
                   "cpu_threads": psutil.cpu_count(logical=True),
-                  "ram_total": f"{vmem.total / (1024**3):.1f} GB Physical",
-                  "os": platform.system() + " " + platform.release() + " (Apple Silicon)"
+                  "ram_total": f"{vmem.total / (1024**3):.1f} GB",
+                  "os": platform.system() + " " + platform.release()
               }
 
           @app.get("/api/stats")
@@ -221,7 +240,8 @@ jobs:
                           result.append({
                               "name": m,
                               "downloaded": m in downloaded,
-                              "type": "vision" if is_vision_model(m) else "text"
+                              "type": "vision" if is_vision_model(m) else "text",
+                              "experimental": is_experimental_model(m)
                           })
                       return {"models": result}
               except Exception as exc:
@@ -293,17 +313,88 @@ jobs:
           async def root():
               return HTML_TEMPLATE
 
+          async def _attempt_ollama_chat(client, ollama_messages, model, temperature, max_tokens, force_cpu=False):
+              """
+              Makes one streaming call to Ollama's /api/chat. Returns a tuple:
+              (outcome, payload)
+                outcome == "crash"   -> payload is the raw crash body (str); caller may retry
+                outcome == "http_error" -> payload is a cleaned error string; no retry
+                outcome == "stream" -> payload is an async generator of SSE-ready dict frames
+              A crash (llama-server / MLX subprocess aborting) surfaces as a non-200
+              response whose body mentions "terminated" / "abort trap" / a signal —
+              distinct from an ordinary validation error like an unknown model name.
+              """
+              options = {
+                  "temperature": temperature,
+                  "num_predict": max_tokens,
+                  "num_ctx": CONTEXT_SIZE,
+              }
+              if force_cpu:
+                  # Forces llama.cpp/MLX to run on CPU instead of the Metal/GPU
+                  # path. This avoids a class of SIGABRT crashes seen with some
+                  # vision-model backends on virtualized/CI Apple Silicon, at
+                  # the cost of much slower generation.
+                  options["num_gpu"] = 0
+
+              req = client.stream(
+                  "POST",
+                  f"{OLLAMA_HOST}/api/chat",
+                  json={
+                      "model": model,
+                      "messages": ollama_messages,
+                      "stream": True,
+                      "options": options,
+                  },
+              )
+              response = await req.__aenter__()
+              try:
+                  if response.status_code != 200:
+                      body = (await response.aread()).decode(errors="ignore")
+                      cleaned = clean_ansi(body)
+                      await req.__aexit__(None, None, None)
+                      if looks_like_backend_crash(cleaned):
+                          return ("crash", cleaned)
+                      return ("http_error", cleaned)
+
+                  async def frames():
+                      try:
+                          async for line in response.aiter_lines():
+                              line = line.strip()
+                              if not line:
+                                  continue
+                              try:
+                                  obj = json.loads(line)
+                              except json.JSONDecodeError:
+                                  continue
+                              if err := obj.get("error"):
+                                  cleaned_err = clean_ansi(err)
+                                  if looks_like_backend_crash(cleaned_err):
+                                      yield {"crash_mid_stream": cleaned_err}
+                                  else:
+                                      yield {"error": cleaned_err}
+                                  continue
+                              content = obj.get("message", {}).get("content")
+                              if content:
+                                  yield {"content": content}
+                      finally:
+                          await req.__aexit__(None, None, None)
+
+                  return ("stream", frames())
+              except Exception:
+                  await req.__aexit__(None, None, None)
+                  raise
+
           @app.post("/api/chat")
           async def chat(request: ChatRequest):
               async def generate():
                   try:
-                      yield f"data: {json.dumps({'activity': 'Initializing inference engine & loading weights into Unified Memory...'})}\n\n"
+                      yield f"data: {json.dumps({'activity': 'Loading weights into unified memory...'})}\n\n"
                       await asyncio.sleep(0.1)
 
                       # All models here are text-generation (or vision-input/text-output)
                       # models served through Ollama's native /api/chat endpoint.
                       # Images the user attaches are passed through as `images`
-                      # on the message; Ollama does not generate images/video.
+                      # on the message; Ollama does not generate images or video.
                       ollama_messages = []
                       for m in request.messages:
                           msg_dict = {"role": m["role"], "content": m["content"]}
@@ -311,47 +402,54 @@ jobs:
                               msg_dict["images"] = m["images"]
                           ollama_messages.append(msg_dict)
 
-                      if "images" in (request.messages[-1] if request.messages else {}) and not is_vision_model(request.model):
-                          yield f"data: {json.dumps({'activity': 'Warning: selected model has no vision support, image will be ignored...'})}\n\n"
+                      last_msg = request.messages[-1] if request.messages else {}
+                      if last_msg.get("images") and not is_vision_model(request.model):
+                          yield f"data: {json.dumps({'activity': 'Note: this model has no vision support — the attached image will be ignored.'})}\n\n"
 
-                      yield f"data: {json.dumps({'activity': f'Generating response using {request.model}...'})}\n\n"
+                      yield f"data: {json.dumps({'activity': f'Generating with {request.model}...'})}\n\n"
 
-                      async with httpx.AsyncClient(timeout=300) as client:
-                          async with client.stream(
-                              "POST",
-                              f"{OLLAMA_HOST}/api/chat",
-                              json={
-                                  "model": request.model,
-                                  "messages": ollama_messages,
-                                  "stream": True,
-                                  "options": {
-                                      "temperature": request.temperature,
-                                      "num_predict": request.max_tokens,
-                                      "num_ctx": CONTEXT_SIZE,
-                                  },
-                              },
-                          ) as response:
-                              if response.status_code != 200:
-                                  body = await response.aread()
-                                  yield f"data: {json.dumps({'error': clean_ansi(body.decode(errors='ignore'))})}\n\n"
+                      async with httpx.AsyncClient(timeout=600) as client:
+                          outcome, payload = await _attempt_ollama_chat(
+                              client, ollama_messages, request.model,
+                              request.temperature, request.max_tokens, force_cpu=False
+                          )
+
+                          if outcome == "crash":
+                              yield f"data: {json.dumps({'activity': 'Model backend crashed (abort trap) — retrying in CPU-only mode, this will be slower...'})}\n\n"
+                              outcome, payload = await _attempt_ollama_chat(
+                                  client, ollama_messages, request.model,
+                                  request.temperature, request.max_tokens, force_cpu=True
+                              )
+                              if outcome == "crash":
+                                  hint = (
+                                      f"'{request.model}' crashed its inference backend twice in a row "
+                                      "(signal: abort trap), including on CPU-only mode. This usually means "
+                                      "the model's backend isn't stable on this runner — often from insufficient "
+                                      "RAM for the model's weights, or the model/quantization not being fully "
+                                      "supported by this Ollama build yet. Try a smaller model, a well-established "
+                                      "vision model such as llava or qwen2.5vl, or a runner with more memory."
+                                  )
+                                  yield f"data: {json.dumps({'error': hint})}\n\n"
                                   yield "data: [DONE]\n\n"
                                   return
 
-                              yield f"data: {json.dumps({'activity': 'Streaming response tokens...'})}\n\n"
-                              async for line in response.aiter_lines():
-                                  line = line.strip()
-                                  if not line:
-                                      continue
-                                  try:
-                                      obj = json.loads(line)
-                                  except json.JSONDecodeError:
-                                      continue
-                                  if err := obj.get("error"):
-                                      yield f"data: {json.dumps({'error': clean_ansi(err)})}\n\n"
-                                      continue
-                                  content = obj.get("message", {}).get("content")
-                                  if content:
-                                      yield f"data: {json.dumps({'content': content})}\n\n"
+                          if outcome == "http_error":
+                              yield f"data: {json.dumps({'error': payload})}\n\n"
+                              yield "data: [DONE]\n\n"
+                              return
+
+                          yield f"data: {json.dumps({'activity': 'Streaming tokens...'})}\n\n"
+                          async for frame in payload:
+                              if "crash_mid_stream" in frame:
+                                  hint = (
+                                      f"'{request.model}' crashed its inference backend mid-response "
+                                      f"(signal: abort trap): {frame['crash_mid_stream']}. Partial output above "
+                                      "may be incomplete. This model may be unstable on this runner — try again, "
+                                      "or switch to a smaller / more established model."
+                                  )
+                                  yield f"data: {json.dumps({'error': hint})}\n\n"
+                                  continue
+                              yield f"data: {json.dumps(frame)}\n\n"
                   except Exception as exc:
                       logger.exception("execution error")
                       yield f"data: {json.dumps({'error': clean_ansi(str(exc))})}\n\n"
@@ -364,11 +462,11 @@ jobs:
           <head>
           <meta charset="UTF-8">
           <meta name="viewport" content="width=device-width, initial-scale=1.0">
-          <title>Local Studio (Pro Multimodal)</title>
+          <title>Local Studio — Console</title>
 
           <link rel="preconnect" href="https://fonts.googleapis.com">
           <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-          <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Vazirmatn:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+          <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 
           <script src="https://cdn.jsdelivr.net/npm/marked@4.3.0/marked.min.js"></script>
           <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.6/purify.min.js"></script>
@@ -377,503 +475,641 @@ jobs:
 
           <style>
             :root {
-              --bg: #09090b;
-              --sidebar: rgba(18, 18, 23, 0.8);
-              --border: rgba(255, 255, 255, 0.08);
-              --text: #f4f4f5;
-              --text-secondary: #a1a1aa;
-              --text-muted: #71717a;
-              --accent: #10b981;
-              --accent-glow: rgba(16, 185, 129, 0.25);
-              --cyan: #06b6d4;
-              --cyan-glow: rgba(6, 182, 212, 0.25);
-              --purple: #a855f7;
-              --user-bg: rgba(6, 182, 212, 0.04);
-              --input-bg: rgba(24, 24, 30, 0.9);
-              --code-bg: rgba(0, 0, 0, 0.5);
-              --danger: #ef4444;
-              --ok: #10b981;
-              --glass: blur(20px);
+              --ink: #131210;
+              --panel: #1b1a16;
+              --panel-raised: #201f1a;
+              --rule: #34322a;
+              --rule-bright: #4a4738;
+              --ivory: #ece7da;
+              --dust: #9a927e;
+              --dust-dim: #6b6558;
+              --amber: #e8a33d;
+              --amber-ink: #2a1c05;
+              --amber-dim: rgba(232, 163, 61, 0.14);
+              --amber-line: rgba(232, 163, 61, 0.4);
+              --signal: #6fae8f;
+              --signal-dim: rgba(111, 174, 143, 0.14);
+              --alert: #d9634a;
+              --alert-dim: rgba(217, 99, 74, 0.14);
+              --radius-s: 4px;
+              --radius-m: 7px;
             }
+
             * { margin: 0; padding: 0; box-sizing: border-box; }
+
+            @media (prefers-reduced-motion: reduce) {
+              *, *::before, *::after { animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; }
+            }
+
+            html, body { height: 100%; }
             body {
-              background: var(--bg); color: var(--text); height: 100vh; display: flex; overflow: hidden;
-              font-family: 'Inter', 'Vazirmatn', -apple-system, sans-serif;
+              background: var(--ink); color: var(--ivory); height: 100vh; display: flex; overflow: hidden;
+              font-family: 'IBM Plex Sans', -apple-system, sans-serif;
+              font-size: 15px;
             }
-            .sidebar {
-              width: 330px; background: var(--sidebar); border-right: 1px solid var(--border);
-              backdrop-filter: var(--glass); -webkit-backdrop-filter: var(--glass);
-              display: flex; flex-direction: column; padding: 22px 18px; flex-shrink: 0; z-index: 10;
-              overflow-y: auto;
-            }
-            .brand-header { display: flex; align-items: center; gap: 10px; margin-bottom: 20px; padding: 0 4px; }
-            .brand-logo {
-              width: 30px; height: 30px; border-radius: 8px;
-              background: linear-gradient(135deg, var(--cyan), var(--accent));
-              display: flex; align-items: center; justify-content: center;
-              font-weight: 700; color: #fff; font-size: 15px; box-shadow: 0 0 15px var(--cyan-glow);
-            }
-            .brand-name { font-size: 15px; font-weight: 600; color: #fff; }
-            .brand-badge {
-              font-size: 10px; background: rgba(6, 182, 212, 0.15); color: var(--cyan);
-              border: 1px solid rgba(6, 182, 212, 0.3); border-radius: 4px; padding: 1px 5px; font-weight: 600;
-            }
-            .new-chat-btn {
-              display: flex; align-items: center; justify-content: center; gap: 8px; width: 100%; padding: 11px;
-              background: var(--input-bg); border: 1px solid var(--border); border-radius: 12px; color: var(--text);
-              font-size: 13px; font-weight: 500; cursor: pointer; margin-bottom: 18px; transition: all 0.2s ease;
-            }
-            .new-chat-btn:hover { border-color: var(--accent); box-shadow: 0 0 15px var(--accent-glow); color: #fff; }
+            ::selection { background: var(--amber-dim); color: var(--ivory); }
+            ::-webkit-scrollbar { width: 9px; height: 9px; }
+            ::-webkit-scrollbar-track { background: transparent; }
+            ::-webkit-scrollbar-thumb { background: var(--rule-bright); border-radius: 5px; border: 2px solid var(--ink); }
 
-            .settings-group { display: flex; flex-direction: column; gap: 14px; font-size: 13px; color: var(--text-secondary); }
-            .settings-group label { display: flex; justify-content: space-between; align-items: center; font-size: 12px; font-weight: 500; }
-            .settings-group input[type="range"] { width: 100%; accent-color: var(--cyan); margin-top: 5px; }
+            a { color: var(--amber); }
+            button { font-family: inherit; }
+            :focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
 
-            .model-section-title {
-              font-weight: 600; color: var(--text); font-size: 12px; text-transform: uppercase;
-              letter-spacing: 0.5px; display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;
+            /* ---------- Rack / sidebar ---------- */
+            .rack {
+              width: 308px; background: var(--panel); border-right: 1px solid var(--rule);
+              display: flex; flex-direction: column; flex-shrink: 0; z-index: 30;
+              overflow-y: auto; transition: transform 0.22s ease;
             }
-            .model-list {
-              background: rgba(0,0,0,0.3); border: 1px solid var(--border); border-radius: 12px;
-              max-height: 240px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; padding: 6px;
+            .rack-header {
+              display: flex; align-items: center; gap: 10px; padding: 18px 18px 14px;
+              border-bottom: 1px solid var(--rule);
             }
-            .model-item {
-              display: flex; align-items: center; justify-content: space-between; padding: 8px 10px;
-              border-radius: 8px; font-size: 12px; cursor: pointer; transition: all 0.2s; border: 1px solid transparent;
+            .rack-mark {
+              width: 28px; height: 28px; border-radius: var(--radius-s); background: var(--amber-dim);
+              border: 1px solid var(--amber-line); display: flex; align-items: center; justify-content: center;
+              font-size: 14px; flex-shrink: 0;
             }
-            .model-item:hover { background: rgba(255,255,255,0.04); }
-            .model-item.active { background: rgba(6, 182, 212, 0.12); border-color: rgba(6, 182, 212, 0.35); }
-            .model-meta { display: flex; flex-direction: column; gap: 3px; overflow: hidden; }
-            .model-name { font-weight: 500; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 155px; }
-            .model-badges { display: flex; align-items: center; gap: 5px; }
-            .model-type-badge { font-size: 9px; padding: 1px 5px; border-radius: 4px; font-weight: 600; text-transform: uppercase; }
-            .model-type-badge.vision { background: rgba(168, 85, 247, 0.18); color: #c084fc; border: 1px solid rgba(168, 85, 247, 0.3); }
-            .model-type-badge.text { background: rgba(6, 182, 212, 0.15); color: #38bdf8; border: 1px solid rgba(6, 182, 212, 0.3); }
-            .model-status { font-size: 10px; font-weight: 500; }
-            .model-status.ready { color: var(--ok); }
-            .model-status.pending { color: var(--text-muted); }
+            .rack-title { font-family: 'Space Grotesk', sans-serif; font-size: 15px; font-weight: 600; color: var(--ivory); line-height: 1.1; }
+            .rack-sub { font-family: 'JetBrains Mono', monospace; font-size: 10.5px; color: var(--dust-dim); margin-top: 2px; }
+            .rack-close {
+              margin-left: auto; display: none; background: transparent; border: 1px solid var(--rule);
+              color: var(--dust); width: 28px; height: 28px; border-radius: var(--radius-s); cursor: pointer;
+            }
+
+            .module { padding: 16px 18px; border-bottom: 1px solid var(--rule); }
+            .module-label {
+              font-size: 11.5px; font-weight: 500; color: var(--dust); margin-bottom: 10px;
+              display: flex; align-items: center; justify-content: space-between;
+            }
+            .module-refresh { background: none; border: none; color: var(--amber); cursor: pointer; font-size: 11px; font-weight: 500; padding: 2px 4px; }
+
+            .new-session-btn {
+              display: flex; align-items: center; justify-content: center; gap: 7px; width: 100%; padding: 9px;
+              background: var(--panel-raised); border: 1px solid var(--rule); border-radius: var(--radius-m); color: var(--ivory);
+              font-size: 13px; font-weight: 500; cursor: pointer; transition: border-color 0.15s ease;
+            }
+            .new-session-btn:hover { border-color: var(--amber-line); }
+
+            .model-list { display: flex; flex-direction: column; gap: 2px; max-height: 260px; overflow-y: auto; }
+            .model-row {
+              display: flex; align-items: center; gap: 9px; padding: 8px 8px; border-radius: var(--radius-s);
+              cursor: default; border: 1px solid transparent;
+            }
+            .model-row[data-clickable="1"] { cursor: pointer; }
+            .model-row[data-clickable="1"]:hover { background: var(--panel-raised); }
+            .model-row.active { background: var(--amber-dim); border-color: var(--amber-line); }
+            .model-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; background: var(--rule-bright); }
+            .model-row.active .model-dot { background: var(--amber); box-shadow: 0 0 6px var(--amber); }
+            .model-row[data-downloaded="1"]:not(.active) .model-dot { background: var(--signal); }
+            .model-meta { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+            .model-name {
+              font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--ivory);
+              white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+            }
+            .model-flags { display: flex; align-items: center; gap: 6px; }
+            .model-chip {
+              font-family: 'JetBrains Mono', monospace; font-size: 9.5px; padding: 1px 5px; border-radius: 3px;
+              border: 1px solid var(--rule-bright); color: var(--dust);
+            }
+            .model-chip.vision { color: var(--signal); border-color: rgba(111,174,143,0.4); }
             .dl-btn {
-              background: rgba(16, 185, 129, 0.15); border: 1px solid var(--accent); color: var(--accent);
-              padding: 4px 10px; border-radius: 6px; font-size: 11px; cursor: pointer; transition: all 0.2s; flex-shrink: 0; font-weight: 600;
+              background: transparent; border: 1px solid var(--rule-bright); color: var(--dust);
+              padding: 4px 9px; border-radius: var(--radius-s); font-size: 11px; cursor: pointer; flex-shrink: 0;
+              font-family: 'JetBrains Mono', monospace; transition: all 0.15s ease;
             }
-            .dl-btn:hover { background: var(--accent); color: #fff; box-shadow: 0 0 10px var(--accent-glow); }
-            .dl-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+            .dl-btn:hover { border-color: var(--amber-line); color: var(--amber); }
+            .dl-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+            .model-list-empty { font-size: 12px; color: var(--dust-dim); padding: 10px 4px; }
 
-            .system-stats {
-              background: rgba(0,0,0,0.3); border: 1px solid var(--border);
-              border-radius: 12px; padding: 12px; margin-top: 6px; font-size: 12px; display: flex; flex-direction: column; gap: 8px;
+            .field { display: flex; flex-direction: column; gap: 6px; margin-top: 14px; }
+            .field:first-child { margin-top: 0; }
+            .field-row { display: flex; justify-content: space-between; align-items: baseline; font-size: 12px; color: var(--dust); }
+            .field-row span.val { font-family: 'JetBrains Mono', monospace; color: var(--amber); }
+            input[type="range"] {
+              -webkit-appearance: none; width: 100%; height: 3px; background: var(--rule-bright); border-radius: 2px; outline: none;
             }
-            .stat-title { font-weight: 600; color: var(--text); font-size: 11px; text-transform: uppercase; }
-            .stat-row { display: flex; justify-content: space-between; align-items: center; }
-            .stat-value { font-family: 'JetBrains Mono', monospace; font-size: 12px; }
-            #sysSpecs { color: var(--text-muted); font-size: 11px; line-height: 1.4; border-bottom: 1px solid rgba(255,255,255,0.05); padding-bottom: 6px; }
-            .progress-bar { width: 100%; height: 5px; background: rgba(255,255,255,0.08); border-radius: 3px; overflow: hidden; margin-top: 3px; }
-            .progress-fill { height: 100%; transition: width 0.3s ease; }
-
-            .sidebar-footer {
-              margin-top: auto; border-top: 1px solid var(--border); padding-top: 14px;
-              font-size: 12px; color: var(--text-secondary); display: flex; flex-direction: column; gap: 8px;
-            }
-            .model-tag {
-              background: rgba(6, 182, 212, 0.1); color: var(--cyan); padding: 5px 10px;
-              border-radius: 6px; font-weight: 600; width: fit-content; border: 1px solid rgba(6, 182, 212, 0.25);
-              max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-            }
-            .status-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; }
-            .status-dot.ok { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
-            .status-dot.bad { background: var(--danger); box-shadow: 0 0 8px var(--danger); }
-
-            .main-content { flex: 1; display: flex; flex-direction: column; height: 100vh; position: relative; }
-
-            .live-activity-bar {
-              background: rgba(6, 182, 212, 0.08); border-bottom: 1px solid rgba(6, 182, 212, 0.2);
-              padding: 8px 24px; font-size: 12px; color: var(--cyan); display: flex; align-items: center; gap: 10px;
-              font-family: 'JetBrains Mono', monospace; display: none;
-            }
-            .activity-spinner {
-              width: 12px; height: 12px; border: 2px solid rgba(6, 182, 212, 0.3); border-top-color: var(--cyan);
-              border-radius: 50%; animation: spin 0.8s linear infinite; flex-shrink: 0;
-            }
-            @keyframes spin { to { transform: rotate(360deg); } }
-
-            .chat-container { flex: 1; overflow-y: auto; display: flex; flex-direction: column; padding: 20px 0 150px 0; scroll-behavior: smooth; }
-
-            .message-row {
-              width: 100%; display: flex; justify-content: center; padding: 22px 20px;
-              border-bottom: 1px solid rgba(255,255,255,0.02); animation: fadeIn 0.25s ease-out;
-            }
-            @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
-            .message-row.user { background: var(--user-bg); }
-            .message-row.error .message-body { color: var(--danger); }
-
-            .message-inner { max-width: 820px; width: 100%; display: flex; gap: 16px; line-height: 1.7; font-size: 15px; }
-            .avatar {
-              width: 32px; height: 32px; border-radius: 8px; display: flex; align-items: center; justify-content: center;
-              font-size: 15px; font-weight: 600; flex-shrink: 0; color: #fff;
-            }
-            .avatar.user { background: linear-gradient(135deg, var(--cyan), #0284c7); box-shadow: 0 2px 10px rgba(6, 182, 212, 0.3); }
-            .avatar.assistant { background: linear-gradient(135deg, var(--accent), #059669); box-shadow: 0 2px 10px rgba(16, 185, 129, 0.3); }
-
-            .message-body { flex: 1; overflow-x: auto; min-width: 0; padding-top: 3px; }
-            .message-body p { margin: 0 0 14px; }
-            .message-body p:last-child { margin-bottom: 0; }
-            .message-body img, .message-body video { max-width: 100%; height: auto; border-radius: 12px; margin: 12px 0; border: 1px solid var(--border); box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
-            .message-body pre {
-              background: var(--code-bg); color: #e2e8f0; padding: 36px 16px 16px; border-radius: 10px;
-              overflow-x: auto; margin: 16px 0; border: 1px solid var(--border); position: relative;
-            }
-            .message-body code { font-family: 'JetBrains Mono', monospace; font-size: 13px; background: rgba(255,255,255,0.08); padding: 2px 5px; border-radius: 4px; }
-            .message-body pre code { background: transparent; padding: 0; }
-
-            .media-preview-container {
-              display: flex; gap: 8px; padding: 0 16px 8px 16px; flex-wrap: wrap;
-            }
-            .media-thumb {
-              position: relative; width: 60px; height: 60px; border-radius: 8px; overflow: hidden;
-              border: 1px solid var(--cyan); background: #000;
-            }
-            .media-thumb img, .media-thumb video { width: 100%; height: 100%; object-fit: cover; }
-            .media-thumb .remove-media {
-              position: absolute; top: 2px; right: 2px; background: rgba(0,0,0,0.7); color: #fff;
-              border: none; border-radius: 50%; width: 18px; height: 18px; font-size: 10px; cursor: pointer;
-              display: flex; align-items: center; justify-content: center;
+            input[type="range"]::-webkit-slider-thumb {
+              -webkit-appearance: none; width: 13px; height: 13px; border-radius: 50%; background: var(--amber);
+              cursor: pointer; border: 2px solid var(--panel);
             }
 
-            .input-area-wrapper {
+            .meter { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+            .meter-label { font-size: 11.5px; color: var(--dust); width: 40px; flex-shrink: 0; }
+            .meter-track { flex: 1; display: flex; gap: 2px; height: 8px; }
+            .meter-seg { flex: 1; background: var(--rule); border-radius: 1px; }
+            .meter-seg.on { background: var(--amber); }
+            .meter-val { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--ivory); width: 38px; text-align: right; flex-shrink: 0; }
+            .hw-line { font-family: 'JetBrains Mono', monospace; font-size: 10.5px; color: var(--dust-dim); line-height: 1.6; margin-bottom: 10px; }
+
+            .rack-footer { margin-top: auto; padding: 14px 18px; display: flex; flex-direction: column; gap: 8px; }
+            .status-line { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--dust); }
+            .status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--dust-dim); flex-shrink: 0; }
+            .status-dot.ok { background: var(--signal); box-shadow: 0 0 5px var(--signal); }
+            .status-dot.bad { background: var(--alert); box-shadow: 0 0 5px var(--alert); }
+            .token-line { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--dust-dim); }
+
+            /* ---------- Main viewport ---------- */
+            .viewport { flex: 1; display: flex; flex-direction: column; height: 100vh; position: relative; min-width: 0; }
+
+            .topbar {
+              display: none; align-items: center; gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--rule);
+              flex-shrink: 0;
+            }
+            .topbar-toggle {
+              background: var(--panel); border: 1px solid var(--rule); color: var(--ivory); width: 34px; height: 34px;
+              border-radius: var(--radius-s); cursor: pointer; font-size: 15px;
+            }
+            .topbar-title { font-family: 'Space Grotesk', sans-serif; font-size: 14px; font-weight: 600; }
+
+            .activity-bar {
+              padding: 7px 24px; font-size: 12px; color: var(--amber); display: none; align-items: center; gap: 9px;
+              font-family: 'JetBrains Mono', monospace; border-bottom: 1px solid var(--rule); flex-shrink: 0;
+            }
+            .activity-dot {
+              width: 6px; height: 6px; border-radius: 50%; background: var(--amber); flex-shrink: 0;
+              animation: pulse 1s ease-in-out infinite;
+            }
+            @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+
+            .log { flex: 1; overflow-y: auto; padding: 8px 0 160px; }
+            .log-inner { max-width: 680px; margin: 0 auto; padding: 0 20px; }
+
+            .turn { padding: 20px 0; border-bottom: 1px solid var(--rule); }
+            .turn:last-child { border-bottom: none; }
+            .turn-label {
+              font-family: 'JetBrains Mono', monospace; font-size: 10.5px; color: var(--dust-dim);
+              margin-bottom: 8px; display: flex; align-items: center; gap: 8px;
+            }
+            .turn.user .turn-label { color: var(--amber); }
+            .turn-body { line-height: 1.65; font-size: 15px; }
+            .turn-body p { margin: 0 0 12px; }
+            .turn-body p:last-child { margin-bottom: 0; }
+            .turn-body img { max-width: 100%; height: auto; border-radius: var(--radius-m); margin: 10px 0; border: 1px solid var(--rule); }
+            .turn-body pre {
+              background: #0e0d0b; color: #e2e8f0; padding: 32px 14px 14px; border-radius: var(--radius-m);
+              overflow-x: auto; margin: 14px 0; border: 1px solid var(--rule); font-size: 13px;
+            }
+            .turn-body code { font-family: 'JetBrains Mono', monospace; font-size: 13px; background: var(--panel-raised); padding: 2px 5px; border-radius: 3px; }
+            .turn-body pre code { background: transparent; padding: 0; }
+            .turn.error .turn-body { color: var(--alert); }
+            .cursor-blink { display: inline-block; width: 7px; height: 14px; background: var(--amber); vertical-align: -2px; animation: blink 0.9s step-end infinite; margin-left: 2px; }
+            @keyframes blink { 50% { opacity: 0; } }
+
+            .empty-state { max-width: 480px; margin: 60px auto; text-align: center; padding: 0 20px; }
+            .empty-state h2 { font-family: 'Space Grotesk', sans-serif; font-size: 18px; font-weight: 600; margin-bottom: 8px; }
+            .empty-state p { color: var(--dust); font-size: 13.5px; line-height: 1.6; }
+
+            .media-row { display: flex; gap: 8px; padding: 0 16px 8px; flex-wrap: wrap; }
+            .media-chip {
+              position: relative; width: 54px; height: 54px; border-radius: var(--radius-s); overflow: hidden;
+              border: 1px solid var(--amber-line); background: #000;
+            }
+            .media-chip img { width: 100%; height: 100%; object-fit: cover; }
+            .media-chip .rm {
+              position: absolute; top: 2px; right: 2px; background: rgba(0,0,0,0.75); color: #fff;
+              border: none; border-radius: 3px; width: 16px; height: 16px; font-size: 10px; cursor: pointer; line-height: 1;
+            }
+
+            .dock-wrap {
               position: absolute; bottom: 0; left: 0; width: 100%;
-              background: linear-gradient(180deg, transparent 0%, var(--bg) 40%);
-              padding: 24px; display: flex; justify-content: center; flex-direction: column; align-items: center;
+              background: linear-gradient(180deg, transparent 0%, var(--ink) 45%);
+              padding: 16px 20px 20px; display: flex; flex-direction: column; align-items: center;
             }
-            .input-box {
-              max-width: 820px; width: 100%; background: var(--input-bg); border: 1px solid var(--border);
-              border-radius: 16px; box-shadow: 0 10px 35px rgba(0,0,0,0.6); display: flex; align-items: flex-end;
-              padding: 10px 14px; gap: 10px; backdrop-filter: var(--glass);
-              transition: border-color 0.25s ease;
+            .dock {
+              max-width: 680px; width: 100%; background: var(--panel); border: 1px solid var(--rule);
+              border-radius: var(--radius-m); display: flex; align-items: flex-end; padding: 8px 8px 8px 14px; gap: 8px;
+              transition: border-color 0.15s ease;
             }
-            .input-box:focus-within { border-color: var(--accent); }
-            .input-box textarea {
-              flex: 1; background: transparent; border: none; color: var(--text); font-family: inherit;
-              font-size: 14.5px; resize: none; outline: none; max-height: 200px; min-height: 26px; line-height: 26px;
+            .dock:focus-within { border-color: var(--amber-line); }
+            .dock textarea {
+              flex: 1; background: transparent; border: none; color: var(--ivory); font-family: inherit;
+              font-size: 14.5px; resize: none; outline: none; max-height: 200px; min-height: 24px; line-height: 24px; padding: 6px 0;
             }
-            .input-box textarea::placeholder { color: var(--text-muted); }
+            .dock textarea::placeholder { color: var(--dust-dim); }
+            .dock textarea:disabled { color: var(--dust-dim); }
 
-            .upload-btn-label {
-              background: rgba(255,255,255,0.06); border: 1px solid var(--border); border-radius: 10px;
-              width: 38px; height: 38px; display: flex; align-items: center; justify-content: center;
-              color: var(--text-secondary); cursor: pointer; transition: all 0.2s; flex-shrink: 0; font-size: 16px;
+            .icon-btn, .send-btn, .stop-btn {
+              border: 1px solid var(--rule-bright); border-radius: var(--radius-s); width: 34px; height: 34px;
+              display: flex; align-items: center; justify-content: center; cursor: pointer; flex-shrink: 0; font-size: 15px;
+              background: transparent; color: var(--dust); transition: all 0.15s ease;
             }
-            .upload-btn-label:hover { background: rgba(255,255,255,0.15); color: #fff; border-color: var(--cyan); }
+            .icon-btn:hover { color: var(--ivory); border-color: var(--rule-bright); }
+            .send-btn { background: var(--amber); border-color: var(--amber); color: var(--amber-ink); font-weight: 600; }
+            .send-btn:hover { background: #f0b25a; }
+            .send-btn:disabled { background: var(--panel-raised); border-color: var(--rule); color: var(--dust-dim); cursor: not-allowed; }
+            .stop-btn { background: var(--alert-dim); border-color: var(--alert); color: var(--alert); display: none; }
 
-            .send-btn, .stop-btn {
-              border: none; border-radius: 10px; width: 38px; height: 38px; display: flex; align-items: center;
-              justify-content: center; color: #fff; cursor: pointer; transition: all 0.2s; flex-shrink: 0; font-size: 16px;
-            }
-            .send-btn { background: var(--accent); box-shadow: 0 2px 10px var(--accent-glow); }
-            .stop-btn { background: var(--danger); display: none; box-shadow: 0 2px 10px rgba(239, 68, 68, 0.3); }
-            .send-btn:hover { background: #059669; }
-            .stop-btn:hover { background: #dc2626; }
+            .dock-hint { font-family: 'JetBrains Mono', monospace; font-size: 10.5px; color: var(--dust-dim); margin-top: 8px; }
 
+            /* ---------- Download modal ---------- */
             .modal-overlay {
-              position: fixed; inset: 0; background: rgba(0,0,0,0.85); backdrop-filter: blur(10px);
-              display: none; align-items: center; justify-content: center; z-index: 100;
+              position: fixed; inset: 0; background: rgba(10,9,7,0.82); backdrop-filter: blur(6px);
+              display: none; align-items: center; justify-content: center; z-index: 100; padding: 20px;
             }
             .modal-box {
-              background: #141419; border: 1px solid var(--border); border-radius: 18px;
-              width: 92%; max-width: 540px; padding: 24px; display: flex; flex-direction: column; gap: 18px;
-              box-shadow: 0 25px 60px rgba(0,0,0,0.8);
+              background: var(--panel); border: 1px solid var(--rule); border-radius: var(--radius-m);
+              width: 100%; max-width: 480px; padding: 22px; display: flex; flex-direction: column; gap: 16px;
             }
-            .modal-header { display: flex; justify-content: space-between; align-items: center; }
-            .modal-title { font-size: 15px; font-weight: 600; color: #fff; display: flex; align-items: center; gap: 8px; }
+            .modal-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+            .modal-name { font-family: 'JetBrains Mono', monospace; font-size: 14px; color: var(--ivory); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+            .modal-pct { font-family: 'JetBrains Mono', monospace; font-size: 16px; font-weight: 600; color: var(--amber); flex-shrink: 0; }
 
-            .metric-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
-            .metric-card {
-              background: rgba(0,0,0,0.4); border: 1px solid var(--border); border-radius: 10px;
-              padding: 10px 12px; display: flex; flex-direction: column; gap: 3px;
+            .metric-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+            .metric { background: var(--panel-raised); border: 1px solid var(--rule); border-radius: var(--radius-s); padding: 8px 10px; }
+            .metric-label { font-size: 10px; color: var(--dust-dim); margin-bottom: 3px; }
+            .metric-val { font-family: 'JetBrains Mono', monospace; font-size: 12.5px; color: var(--ivory); }
+
+            .modal-bar-track { width: 100%; height: 6px; background: var(--rule); border-radius: 3px; overflow: hidden; }
+            .modal-bar-fill { height: 100%; background: var(--amber); width: 0%; transition: width 0.25s ease-out; }
+
+            .term { background: #0e0d0b; border: 1px solid var(--rule); border-radius: var(--radius-s); padding: 10px 12px;
+              height: 120px; overflow-y: auto; font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #94a3b8; line-height: 1.6; }
+            .term-line.error { color: var(--alert); font-weight: 600; }
+
+            .modal-btn {
+              align-self: flex-end; background: transparent; border: 1px solid var(--rule-bright); color: var(--ivory);
+              padding: 7px 16px; border-radius: var(--radius-s); cursor: pointer; font-size: 12.5px; font-weight: 500;
             }
-            .metric-label { font-size: 10px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; }
-            .metric-val { font-family: 'JetBrains Mono', monospace; font-size: 13px; font-weight: 600; color: var(--cyan); }
+            .modal-btn:hover:not(:disabled) { border-color: var(--amber-line); color: var(--amber); }
+            .modal-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
-            .dl-bar-container { display: flex; flex-direction: column; gap: 6px; }
-            .dl-modal-bar { width: 100%; height: 7px; background: rgba(255,255,255,0.08); border-radius: 4px; overflow: hidden; }
-            .dl-modal-fill { height: 100%; background: linear-gradient(90deg, var(--cyan), var(--accent)); width: 0%; transition: width 0.25s ease-out; }
-            .dl-bar-info { display: flex; justify-content: space-between; font-size: 12px; color: var(--text-secondary); }
-
-            .terminal-container {
-              background: #09090b; border: 1px solid var(--border); border-radius: 10px;
-              padding: 12px; height: 130px; overflow-y: auto; font-family: 'JetBrains Mono', monospace;
-              font-size: 11.5px; color: #94a3b8; line-height: 1.6; display: flex; flex-direction: column;
+            .backdrop-scrim {
+              position: fixed; inset: 0; background: rgba(10,9,7,0.6); z-index: 25; display: none;
             }
-            .terminal-line { word-break: break-all; }
-            .terminal-line.success { color: var(--ok); font-weight: 600; }
-            .terminal-line.error { color: var(--danger); font-weight: 600; }
 
-            .modal-close-btn {
-              align-self: flex-end; background: rgba(255,255,255,0.08); border: 1px solid var(--border); color: #fff;
-              padding: 8px 20px; border-radius: 8px; cursor: pointer; font-size: 12.5px; font-weight: 500; transition: all 0.2s;
+            /* ---------- Responsive ---------- */
+            @media (max-width: 860px) {
+              .rack {
+                position: fixed; top: 0; left: 0; height: 100%; transform: translateX(-100%); box-shadow: 0 0 40px rgba(0,0,0,0.5);
+              }
+              .rack.open { transform: translateX(0); }
+              .rack-close { display: flex; align-items: center; justify-content: center; }
+              .topbar { display: flex; }
+              .backdrop-scrim.show { display: block; }
             }
-            .modal-close-btn:hover { background: rgba(255,255,255,0.18); }
           </style>
           </head>
           <body>
+
+            <div class="backdrop-scrim" id="scrim"></div>
+
             <div class="modal-overlay" id="downloadModal">
               <div class="modal-box">
-                <div class="modal-header">
-                  <div class="modal-title">📥 <span id="modalTitle">Pulling Model</span></div>
-                  <span id="modalPercent" style="font-family:'JetBrains Mono',monospace; font-size:14px; font-weight:700; color:var(--cyan);">0%</span>
+                <div class="modal-head">
+                  <span class="modal-name" id="modalTitle">model</span>
+                  <span class="modal-pct" id="modalPercent">0%</span>
                 </div>
-
-                <div class="metric-grid">
-                  <div class="metric-card">
-                    <span class="metric-label">Speed</span>
-                    <span class="metric-val" id="metricSpeed">-- MB/s</span>
-                  </div>
-                  <div class="metric-card">
-                    <span class="metric-label">Size</span>
-                    <span class="metric-val" id="metricSize">-- / --</span>
-                  </div>
-                  <div class="metric-card">
-                    <span class="metric-label">ETA</span>
-                    <span class="metric-val" id="metricEta">--</span>
-                  </div>
+                <div class="metric-row">
+                  <div class="metric"><div class="metric-label">Speed</div><div class="metric-val" id="metricSpeed">—</div></div>
+                  <div class="metric"><div class="metric-label">Size</div><div class="metric-val" id="metricSize">—</div></div>
+                  <div class="metric"><div class="metric-label">ETA</div><div class="metric-val" id="metricEta">—</div></div>
                 </div>
-
-                <div class="dl-bar-container">
-                  <div class="dl-modal-bar"><div class="dl-modal-fill" id="modalBar"></div></div>
-                  <div class="dl-bar-info"><span id="modalStatus" style="font-size:11.5px;">Connecting...</span></div>
-                </div>
-
-                <div class="terminal-container" id="modalLogs"></div>
-                <button class="modal-close-btn" id="modalCloseBtn" onclick="closeModal()" disabled>Downloading...</button>
+                <div class="modal-bar-track"><div class="modal-bar-fill" id="modalBar"></div></div>
+                <div class="term" id="modalLogs"></div>
+                <button class="modal-btn" id="modalCloseBtn" disabled>Downloading…</button>
               </div>
             </div>
 
-            <div class="sidebar">
-              <div class="brand-header">
-                <div class="brand-logo">🦙</div>
-                <div class="brand-name">Local Studio</div>
-                <span class="brand-badge">Pro</span>
+            <nav class="rack" id="rack">
+              <div class="rack-header">
+                <div class="rack-mark">🦙</div>
+                <div>
+                  <div class="rack-title">Local Studio</div>
+                  <div class="rack-sub">console v2</div>
+                </div>
+                <button class="rack-close" id="rackClose" aria-label="Close model panel">✕</button>
               </div>
 
-              <button class="new-chat-btn" onclick="clearChat()"><span>＋</span> New Chat</button>
+              <div class="module">
+                <button class="new-session-btn" id="newSessionBtn">＋ New session</button>
+              </div>
 
-              <div class="settings-group">
-                <div class="model-section-title">
-                  <span>Model Selector</span>
-                  <button onclick="loadModels()" style="background:none; border:none; color:var(--cyan); cursor:pointer; font-size:11px; font-weight:600;">🔄 Refresh</button>
+              <div class="module">
+                <div class="module-label">
+                  <span>Models</span>
+                  <button class="module-refresh" id="refreshBtn">refresh</button>
                 </div>
                 <div class="model-list" id="modelListContainer">
-                  <div style="padding: 10px; text-align: center; color: var(--text-muted);">Scanning repository...</div>
-                </div>
-
-                <div>
-                  <label>Temperature <span id="tempVal" style="color: var(--cyan); font-family:monospace;">0.7</span></label>
-                  <input type="range" id="temperature" min="0" max="2" step="0.1" value="0.7">
-                </div>
-
-                <div>
-                  <label>Max Tokens <span id="tokenVal" style="color: var(--cyan); font-family:monospace;">2048</span></label>
-                  <input type="range" id="maxTokens" min="128" max="4096" step="128" value="2048">
+                  <div class="model-list-empty">Reading model catalog…</div>
                 </div>
               </div>
 
-              <div class="system-stats">
-                <div class="stat-title">🖥️ Server Resources</div>
-                <div id="sysSpecs">Loading hardware...</div>
-
-                <div class="stat-row">
-                  <span>CPU Usage:</span>
-                  <span id="cpuVal" class="stat-value" style="color: var(--cyan);">0%</span>
+              <div class="module">
+                <div class="field">
+                  <div class="field-row"><span>Temperature</span><span class="val" id="tempVal">0.7</span></div>
+                  <input type="range" id="temperature" min="0" max="2" step="0.1" value="0.7" aria-label="Temperature">
                 </div>
-                <div class="progress-bar"><div id="cpuBar" class="progress-fill" style="background: var(--cyan); width: 0%;"></div></div>
-
-                <div class="stat-row" style="margin-top: 4px;">
-                  <span>RAM Usage:</span>
-                  <span id="ramVal" class="stat-value" style="color: var(--accent);">0%</span>
-                </div>
-                <div class="progress-bar"><div id="ramBar" class="progress-fill" style="background: var(--accent); width: 0%;"></div></div>
-
-                <div class="stat-row" style="margin-top: 4px;">
-                  <span>Storage Free:</span>
-                  <span id="diskFreeVal" class="stat-value" style="color: var(--ok);">0 GB</span>
+                <div class="field">
+                  <div class="field-row"><span>Max tokens</span><span class="val" id="tokenVal">2048</span></div>
+                  <input type="range" id="maxTokens" min="128" max="4096" step="128" value="2048" aria-label="Max tokens">
                 </div>
               </div>
 
-              <div class="sidebar-footer">
-                <span class="model-tag" id="currentModelTag">📦 Loading...</span>
-                <span id="statusIndicator"><span class="status-dot ok"></span>Connecting...</span>
-                <span id="tokenCounter" style="color: var(--cyan); font-family: 'JetBrains Mono', monospace; font-size: 11px;">Tokens generated: 0</span>
-              </div>
-            </div>
-
-            <div class="main-content">
-              <div class="live-activity-bar" id="liveActivityBar">
-                <div class="activity-spinner"></div>
-                <span id="liveActivityText">System ready...</span>
-              </div>
-
-              <div class="chat-container" id="chatContainer">
-                <div class="message-row assistant">
-                  <div class="message-inner">
-                    <div class="avatar assistant">✦</div>
-                    <div class="message-body" id="welcomeMsg"></div>
-                  </div>
+              <div class="module">
+                <div class="module-label"><span>Hardware</span></div>
+                <div class="hw-line" id="sysSpecs">reading host specs…</div>
+                <div class="meter">
+                  <span class="meter-label">CPU</span>
+                  <div class="meter-track" id="cpuMeter"></div>
+                  <span class="meter-val" id="cpuVal">0%</span>
+                </div>
+                <div class="meter">
+                  <span class="meter-label">RAM</span>
+                  <div class="meter-track" id="ramMeter"></div>
+                  <span class="meter-val" id="ramVal">0%</span>
+                </div>
+                <div class="meter">
+                  <span class="meter-label">Disk</span>
+                  <div class="meter-track"></div>
+                  <span class="meter-val" id="diskFreeVal" style="width:auto;">—</span>
                 </div>
               </div>
 
-              <div class="input-area-wrapper">
-                <div class="media-preview-container" id="mediaPreviewContainer"></div>
-                <div class="input-box">
-                  <label class="upload-btn-label" title="Attach image for vision models (llava, qwen2.5vl, deepseek-ocr)">
-                    📎
-                    <input type="file" id="mediaInput" accept="image/*" style="display:none;" onchange="handleMediaUpload(event)">
-                  </label>
-                  <textarea id="userInput" placeholder="Ask a question, or attach an image for a vision model..." rows="1"></textarea>
-                  <button class="send-btn" id="sendButton" onclick="sendMessage()">↑</button>
-                  <button class="stop-btn" id="stopButton" onclick="stopGenerating()">■</button>
+              <div class="rack-footer">
+                <div class="status-line"><span class="status-dot" id="engineDot"></span><span id="engineText">Checking engine…</span></div>
+                <div class="token-line" id="tokenCounter">0 tokens generated</div>
+              </div>
+            </nav>
+
+            <div class="viewport">
+              <div class="topbar">
+                <button class="topbar-toggle" id="rackOpenBtn" aria-label="Open model panel">☰</button>
+                <span class="topbar-title" id="topbarModel">No model selected</span>
+              </div>
+
+              <div class="activity-bar" id="activityBar">
+                <span class="activity-dot"></span>
+                <span id="activityText">Idle</span>
+              </div>
+
+              <div class="log" id="log">
+                <div class="log-inner" id="logInner"></div>
+              </div>
+
+              <div class="dock-wrap">
+                <div class="media-row" id="mediaRow"></div>
+                <div class="dock">
+                  <button class="icon-btn" id="attachBtn" title="Attach an image for a vision model" aria-label="Attach image">📎</button>
+                  <input type="file" id="mediaInput" accept="image/*" style="display:none;">
+                  <textarea id="userInput" placeholder="Download a model to begin…" rows="1" disabled></textarea>
+                  <button class="send-btn" id="sendButton" aria-label="Send message" disabled>⏎</button>
+                  <button class="stop-btn" id="stopButton" aria-label="Stop generating">■</button>
                 </div>
+                <div class="dock-hint">Enter to send · Shift+Enter for a new line</div>
               </div>
             </div>
 
           <script>
             marked.setOptions({ gfm: true, breaks: true });
-            function renderInto(el, text, opts = {}) {
-              el.innerHTML = DOMPurify.sanitize(marked.parse(text)) + (opts.loading ? '<span class="loading-dots"></span>' : '');
+
+            const $ = (id) => document.getElementById(id);
+            const logInner = $('logInner');
+            const logEl = $('log');
+            const userInput = $('userInput');
+            const sendButton = $('sendButton');
+            const stopButton = $('stopButton');
+            const attachBtn = $('attachBtn');
+            const mediaInput = $('mediaInput');
+            const mediaRow = $('mediaRow');
+            const tokenCounter = $('tokenCounter');
+            const temperatureEl = $('temperature');
+            const maxTokensEl = $('maxTokens');
+            const modelListContainer = $('modelListContainer');
+            const topbarModel = $('topbarModel');
+            const activityBar = $('activityBar');
+            const activityText = $('activityText');
+            const engineDot = $('engineDot');
+            const engineText = $('engineText');
+            const rack = $('rack');
+            const scrim = $('scrim');
+
+            const downloadModal = $('downloadModal');
+            const modalTitle = $('modalTitle');
+            const modalBar = $('modalBar');
+            const modalPercent = $('modalPercent');
+            const modalLogs = $('modalLogs');
+            const modalCloseBtn = $('modalCloseBtn');
+            const metricSpeed = $('metricSpeed');
+            const metricSize = $('metricSize');
+            const metricEta = $('metricEta');
+
+            let isStreaming = false;
+            let totalTokens = 0;
+            let messageHistory = [];
+            let controller = null;
+            let currentModel = null;
+            let attachedMediaBase64 = null;
+            let knownModels = [];
+
+            function escapeHtml(str) {
+              const div = document.createElement('div');
+              div.textContent = str;
+              return div.innerHTML;
             }
 
-            const chatContainer = document.getElementById('chatContainer');
-            const userInput = document.getElementById('userInput');
-            const sendButton = document.getElementById('sendButton');
-            const stopButton = document.getElementById('stopButton');
-            const tokenCounter = document.getElementById('tokenCounter');
-            const temperatureEl = document.getElementById('temperature');
-            const maxTokensEl = document.getElementById('maxTokens');
-            const modelListContainer = document.getElementById('modelListContainer');
-            const currentModelTag = document.getElementById('currentModelTag');
-            const liveActivityBar = document.getElementById('liveActivityBar');
-            const liveActivityText = document.getElementById('liveActivityText');
-
-            const downloadModal = document.getElementById('downloadModal');
-            const modalTitle = document.getElementById('modalTitle');
-            const modalBar = document.getElementById('modalBar');
-            const modalPercent = document.getElementById('modalPercent');
-            const modalLogs = document.getElementById('modalLogs');
-            const modalCloseBtn = document.getElementById('modalCloseBtn');
-            const metricSpeed = document.getElementById('metricSpeed');
-            const metricSize = document.getElementById('metricSize');
-            const metricEta = document.getElementById('metricEta');
-
-            let isStreaming = false, totalTokens = 0, messageHistory = [], controller = null, currentModel = null, currentModelType = 'text';
-            let attachedMediaBase64 = null;
+            function renderMarkdown(el, text, loading) {
+              el.innerHTML = DOMPurify.sanitize(marked.parse(text || '')) + (loading ? '<span class="cursor-blink"></span>' : '');
+            }
 
             function setActivity(text) {
               if (text) {
-                liveActivityBar.style.display = 'flex';
-                liveActivityText.textContent = text;
+                activityBar.style.display = 'flex';
+                activityText.textContent = text;
               } else {
-                liveActivityBar.style.display = 'none';
+                activityBar.style.display = 'none';
               }
             }
 
-            function handleMediaUpload(event) {
+            function renderMeterSegments(container, percent, segCount) {
+              const on = Math.round((percent / 100) * segCount);
+              let html = '';
+              for (let i = 0; i < segCount; i++) {
+                html += `<div class="meter-seg${i < on ? ' on' : ''}"></div>`;
+              }
+              container.innerHTML = html;
+            }
+
+            // ---------- Sidebar drawer (mobile) ----------
+            function openRack() { rack.classList.add('open'); scrim.classList.add('show'); }
+            function closeRack() { rack.classList.remove('open'); scrim.classList.remove('show'); }
+            $('rackOpenBtn').addEventListener('click', openRack);
+            $('rackClose').addEventListener('click', closeRack);
+            scrim.addEventListener('click', closeRack);
+
+            // ---------- Attach / media ----------
+            attachBtn.addEventListener('click', () => mediaInput.click());
+            mediaInput.addEventListener('change', (event) => {
               const file = event.target.files[0];
               if (!file) return;
               const reader = new FileReader();
-              reader.onload = function(e) {
+              reader.onload = (e) => {
                 attachedMediaBase64 = e.target.result.split(',')[1];
-                const previewContainer = document.getElementById('mediaPreviewContainer');
-                previewContainer.innerHTML = `
-                  <div class="media-thumb">
-                    <img src="${e.target.result}">
-                    <button class="remove-media" onclick="removeMedia()">×</button>
-                  </div>
-                `;
+                mediaRow.innerHTML = `
+                  <div class="media-chip">
+                    <img src="${e.target.result}" alt="Attached image preview">
+                    <button class="rm" id="removeMediaBtn" aria-label="Remove attached image">✕</button>
+                  </div>`;
+                $('removeMediaBtn').addEventListener('click', removeMedia);
               };
               reader.readAsDataURL(file);
-            }
+            });
 
             function removeMedia() {
               attachedMediaBase64 = null;
-              document.getElementById('mediaPreviewContainer').innerHTML = '';
-              document.getElementById('mediaInput').value = '';
+              mediaRow.innerHTML = '';
+              mediaInput.value = '';
             }
 
+            // ---------- Host telemetry ----------
             async function fetchSysInfo() {
               try {
                 const r = await fetch('/api/sysinfo');
                 const data = await r.json();
-                document.getElementById('sysSpecs').innerHTML = `OS: ${data.os}<br>CPU: ${data.cpu_threads} Threads<br>Memory: ${data.ram_total}`;
-              } catch (e) {}
+                $('sysSpecs').textContent = `${data.os} · ${data.cpu_threads} threads · ${data.ram_total} RAM`;
+              } catch (e) {
+                $('sysSpecs').textContent = 'Host specs unavailable';
+              }
             }
 
             async function fetchStats() {
               try {
                 const r = await fetch('/api/stats');
                 const data = await r.json();
-                document.getElementById('cpuVal').textContent = data.cpu_percent.toFixed(1) + '%';
-                document.getElementById('cpuBar').style.width = data.cpu_percent + '%';
-                document.getElementById('ramVal').textContent = data.ram_percent.toFixed(1) + '%';
-                document.getElementById('ramBar').style.width = data.ram_percent + '%';
-                document.getElementById('diskFreeVal').textContent = data.disk_free;
-              } catch (e) {}
+                $('cpuVal').textContent = data.cpu_percent.toFixed(0) + '%';
+                renderMeterSegments($('cpuMeter'), data.cpu_percent, 20);
+                $('ramVal').textContent = data.ram_percent.toFixed(0) + '%';
+                renderMeterSegments($('ramMeter'), data.ram_percent, 20);
+                $('diskFreeVal').textContent = data.disk_free;
+              } catch (e) { /* transient — leave last known values on screen */ }
+            }
+
+            async function pollHealth() {
+              try {
+                const r = await fetch('/api/health');
+                if (r.ok) {
+                  engineDot.className = 'status-dot ok';
+                  engineText.textContent = 'Engine online';
+                } else {
+                  throw new Error('unhealthy');
+                }
+              } catch (e) {
+                engineDot.className = 'status-dot bad';
+                engineText.textContent = 'Engine unreachable';
+              }
             }
 
             fetchSysInfo();
+            fetchStats();
+            pollHealth();
             setInterval(fetchStats, 3000);
+            setInterval(pollHealth, 8000);
 
+            // ---------- Model list (event-delegated, no inline handlers) ----------
             async function loadModels() {
               try {
                 const resp = await fetch('/api/models');
+                if (!resp.ok) throw new Error('bad response');
                 const data = await resp.json();
-                const models = data.models || [];
+                knownModels = data.models || [];
+                renderModelList();
 
-                modelListContainer.innerHTML = models.map(m => `
-                  <div class="model-item ${m.name === currentModel ? 'active' : ''}" onclick="${m.downloaded ? `selectModel('${m.name}', '${m.type}')` : ''}">
-                    <div class="model-meta">
-                      <div class="model-badges">
-                        <span class="model-name" title="${m.name}">${m.name}</span>
-                        <span class="model-type-badge ${m.type}">${m.type}</span>
-                      </div>
-                      <span class="model-status ${m.downloaded ? 'ready' : 'pending'}">${m.downloaded ? '🟢 Ready' : '📥 Not Downloaded'}</span>
-                    </div>
-                    ${!m.downloaded ? `<button class="dl-btn" onclick="startModelDownload('${m.name}', event)">Download</button>` : ''}
-                  </div>
-                `).join('');
-
-                const downloaded = models.filter(m => m.downloaded);
+                const downloaded = knownModels.filter(m => m.downloaded);
                 if (!currentModel && downloaded.length > 0) {
-                  selectModel(downloaded[0].name, downloaded[0].type);
+                  selectModel(downloaded[0].name);
                 }
-              } catch (e) {}
+                updateComposerState();
+              } catch (e) {
+                modelListContainer.innerHTML = '<div class="model-list-empty">Could not reach the engine. Check that Ollama is running, then hit refresh.</div>';
+              }
             }
 
-            function selectModel(modelName, modelType = 'text') {
+            function renderModelList() {
+              if (!knownModels.length) {
+                modelListContainer.innerHTML = '<div class="model-list-empty">No models found.</div>';
+                return;
+              }
+              modelListContainer.innerHTML = knownModels.map(m => {
+                const active = m.name === currentModel;
+                return `
+                  <div class="model-row${active ? ' active' : ''}" data-model="${escapeHtml(m.name)}" data-downloaded="${m.downloaded ? '1' : '0'}" data-clickable="${m.downloaded ? '1' : '0'}">
+                    <span class="model-dot"></span>
+                    <div class="model-meta">
+                      <span class="model-name">${escapeHtml(m.name)}</span>
+                      <div class="model-flags">
+                        <span class="model-chip ${m.type}">${m.type}</span>
+                        <span class="model-chip">${m.downloaded ? 'ready' : 'not pulled'}</span>
+                      </div>
+                    </div>
+                    ${!m.downloaded ? `<button class="dl-btn" data-pull="${escapeHtml(m.name)}">Pull</button>` : ''}
+                  </div>`;
+              }).join('');
+            }
+
+            modelListContainer.addEventListener('click', (e) => {
+              const pullBtn = e.target.closest('[data-pull]');
+              if (pullBtn) {
+                startModelDownload(pullBtn.getAttribute('data-pull'));
+                return;
+              }
+              const row = e.target.closest('.model-row[data-clickable="1"]');
+              if (row) {
+                selectModel(row.getAttribute('data-model'));
+              }
+            });
+
+            $('refreshBtn').addEventListener('click', loadModels);
+
+            function selectModel(modelName) {
               currentModel = modelName;
-              currentModelType = modelType;
-              currentModelTag.textContent = `📦 ${modelName}`;
-              loadModels();
+              topbarModel.textContent = modelName;
+              renderModelList();
+              updateComposerState();
             }
 
-            function appendTerminalLog(msg, type = 'normal') {
+            function updateComposerState() {
+              const ready = !!currentModel;
+              userInput.disabled = !ready;
+              sendButton.disabled = !ready;
+              userInput.placeholder = ready
+                ? 'Ask a question, or attach an image for a vision model…'
+                : 'Download a model from the panel to begin…';
+              if (!ready) {
+                renderEmptyLog();
+              }
+            }
+
+            function renderEmptyLog() {
+              if (messageHistory.length) return;
+              logInner.innerHTML = `
+                <div class="empty-state">
+                  <h2>No model loaded yet</h2>
+                  <p>Pick a model in the panel and hit "Pull" to download it, then select it to start a session. Vision-tagged models accept an attached image; none of these models can generate images.</p>
+                </div>`;
+            }
+
+            // ---------- Model download ----------
+            function appendTerminalLog(msg, type = '') {
               const line = document.createElement('div');
-              line.className = 'terminal-line ' + type;
+              line.className = 'term-line' + (type ? ' ' + type : '');
               line.textContent = msg;
               modalLogs.appendChild(line);
               modalLogs.scrollTop = modalLogs.scrollHeight;
             }
 
-            function closeModal() {
-              downloadModal.style.display = 'none';
-            }
+            function closeModal() { downloadModal.style.display = 'none'; }
 
-            async function startModelDownload(modelName, event) {
-              if (event) event.stopPropagation();
+            async function startModelDownload(modelName) {
               downloadModal.style.display = 'flex';
               modalTitle.textContent = modelName;
               modalBar.style.width = '0%';
               modalPercent.textContent = '0%';
               modalLogs.innerHTML = '';
+              metricSpeed.textContent = '—'; metricSize.textContent = '—'; metricEta.textContent = '—';
               modalCloseBtn.disabled = true;
-              modalCloseBtn.textContent = 'Downloading...';
+              modalCloseBtn.textContent = 'Downloading…';
+              modalCloseBtn.onclick = null;
 
               try {
                 const resp = await fetch('/api/pull', {
@@ -883,6 +1119,7 @@ jobs:
                 const reader = resp.body.getReader();
                 const decoder = new TextDecoder();
                 let buffer = '';
+                let failed = false;
 
                 while (true) {
                   const { done, value } = await reader.read();
@@ -893,105 +1130,124 @@ jobs:
 
                   for (const line of lines) {
                     if (!line.startsWith('data: ')) continue;
+                    if (line.slice(6) === '[DONE]') continue;
                     try {
                       const data = JSON.parse(line.slice(6));
                       if (data.error) {
                         appendTerminalLog(data.error, 'error');
+                        failed = true;
                         modalCloseBtn.disabled = false;
                         modalCloseBtn.textContent = 'Close';
-                        modalCloseBtn.onclick = () => downloadModal.style.display = 'none';
-                        return;
+                        modalCloseBtn.onclick = closeModal;
+                        continue;
                       }
                       if (data.raw) appendTerminalLog(data.raw);
-                      if (data.percent !== undefined) {
+                      if (data.percent !== undefined && data.percent !== null) {
                         modalBar.style.width = data.percent + '%';
                         modalPercent.textContent = data.percent + '%';
                       }
                       if (data.speed) metricSpeed.textContent = data.speed;
                       if (data.size) metricSize.textContent = data.size;
                       if (data.eta) metricEta.textContent = data.eta;
-                    } catch (e) {}
+                    } catch (e) { /* ignore malformed keepalive frames */ }
                   }
                 }
 
-                modalBar.style.width = '100%';
-                modalPercent.textContent = '100%';
-                modalCloseBtn.disabled = false;
-                modalCloseBtn.textContent = 'Done & Select';
-                modalCloseBtn.onclick = () => {
-                  downloadModal.style.display = 'none';
-                  selectModel(modelName, 'text');
-                };
-                loadModels();
+                if (!failed) {
+                  modalBar.style.width = '100%';
+                  modalPercent.textContent = '100%';
+                  modalCloseBtn.disabled = false;
+                  modalCloseBtn.textContent = 'Done — select model';
+                  modalCloseBtn.onclick = () => { closeModal(); loadModels().then(() => selectModel(modelName)); };
+                  loadModels();
+                }
               } catch (err) {
+                appendTerminalLog('Connection lost during download: ' + err.message, 'error');
                 modalCloseBtn.disabled = false;
                 modalCloseBtn.textContent = 'Close';
-                modalCloseBtn.onclick = () => downloadModal.style.display = 'none';
+                modalCloseBtn.onclick = closeModal;
               }
             }
 
-            function appendMessage(role, content, isLoading = false, isError = false) {
-              const row = document.createElement('div');
-              row.className = `message-row ${role}` + (isError ? ' error' : '');
-              row.innerHTML = `<div class="message-inner"><div class="avatar ${role}">${role === 'user' ? '👤' : '✦'}</div><div class="message-body"></div></div>`;
-              chatContainer.appendChild(row);
-              const body = row.querySelector('.message-body');
-              renderInto(body, content, { loading: isLoading });
-              chatContainer.scrollTop = chatContainer.scrollHeight;
+            // ---------- Chat log ----------
+            function appendTurn(role, htmlContent, isLoading, isError) {
+              const turn = document.createElement('div');
+              turn.className = `turn ${role}` + (isError ? ' error' : '');
+              const label = role === 'user' ? 'You' : 'Console';
+              turn.innerHTML = `<div class="turn-label">${label}</div><div class="turn-body"></div>`;
+              logInner.appendChild(turn);
+              const body = turn.querySelector('.turn-body');
+              renderMarkdown(body, htmlContent, isLoading);
+              logEl.scrollTop = logEl.scrollHeight;
               return body;
             }
 
-            function updateLastAssistantMessage(content, isComplete = false) {
-              const rows = chatContainer.querySelectorAll('.message-row.assistant');
-              if (!rows.length) return;
-              renderInto(rows[rows.length - 1].querySelector('.message-body'), content, { loading: !isComplete });
-              chatContainer.scrollTop = chatContainer.scrollHeight;
+            function updateLastAssistantTurn(content, complete) {
+              const turns = logInner.querySelectorAll('.turn.assistant');
+              if (!turns.length) return;
+              renderMarkdown(turns[turns.length - 1].querySelector('.turn-body'), content, !complete);
+              logEl.scrollTop = logEl.scrollHeight;
             }
 
-            function clearChat() {
-              const rows = chatContainer.querySelectorAll('.message-row');
-              for (let i = 1; i < rows.length; i++) rows[i].remove();
-              messageHistory = []; totalTokens = 0;
+            function newSession() {
+              logInner.innerHTML = '';
+              messageHistory = [];
+              totalTokens = 0;
+              tokenCounter.textContent = '0 tokens generated';
+              if (!currentModel) renderEmptyLog();
             }
+            $('newSessionBtn').addEventListener('click', newSession);
 
             function stopGenerating() {
               if (controller) controller.abort();
             }
+            stopButton.addEventListener('click', stopGenerating);
 
             async function sendMessage() {
-              if (isStreaming) return;
+              if (isStreaming || !currentModel) return;
               const text = userInput.value.trim();
-              if ((!text && !attachedMediaBase64) || !currentModel) return;
+              if (!text && !attachedMediaBase64) return;
 
-              let displayContent = text;
-              let userMessageObj = { role: 'user', content: text };
+              let displayHtml = escapeHtml(text).replace(/\n/g, '<br>');
+              const userMessageObj = { role: 'user', content: text };
 
               if (attachedMediaBase64) {
                 userMessageObj.images = [attachedMediaBase64];
-                displayContent += `<br><img src="data:image/jpeg;base64,${attachedMediaBase64}" style="max-height:150px; border-radius:8px; margin-top:8px;">`;
+                displayHtml += `<br><img src="data:image/jpeg;base64,${attachedMediaBase64}" alt="Attached image">`;
               }
 
-              appendMessage('user', displayContent);
+              appendTurn('user', displayHtml, false, false);
               messageHistory.push(userMessageObj);
 
-              userInput.value = ''; userInput.style.height = 'auto';
+              userInput.value = '';
+              userInput.style.height = 'auto';
               removeMedia();
-              sendButton.style.display = 'none'; stopButton.style.display = 'flex';
-              isStreaming = true; controller = new AbortController();
+              sendButton.style.display = 'none';
+              stopButton.style.display = 'flex';
+              isStreaming = true;
+              controller = new AbortController();
 
-              setActivity("Connecting to engine...");
-              appendMessage('assistant', 'Processing request...', true);
+              setActivity('Connecting to engine…');
+              appendTurn('assistant', '', true, false);
 
               let fullContent = '';
               try {
                 const response = await fetch('/api/chat', {
-                  method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
-                  body: JSON.stringify({ messages: messageHistory, model: currentModel, temperature: parseFloat(temperatureEl.value), max_tokens: parseInt(maxTokensEl.value) })
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  signal: controller.signal,
+                  body: JSON.stringify({
+                    messages: messageHistory,
+                    model: currentModel,
+                    temperature: parseFloat(temperatureEl.value),
+                    max_tokens: parseInt(maxTokensEl.value, 10)
+                  })
                 });
 
                 const reader = response.body.getReader();
                 const decoder = new TextDecoder();
-                let buffer = '', streamError = null;
+                let buffer = '';
+                let streamError = null;
 
                 while (true) {
                   const { done, value } = await reader.read();
@@ -1001,53 +1257,53 @@ jobs:
                   buffer = lines.pop() || '';
                   for (const line of lines) {
                     if (!line.startsWith('data: ')) continue;
+                    if (line.slice(6) === '[DONE]') continue;
                     try {
                       const parsed = JSON.parse(line.slice(6));
                       if (parsed.activity) setActivity(parsed.activity);
                       if (parsed.error) streamError = parsed.error;
                       else if (parsed.content) {
                         fullContent += parsed.content;
-                        updateLastAssistantMessage(fullContent, false);
+                        updateLastAssistantTurn(fullContent, false);
                       }
-                    } catch (e) {}
+                    } catch (e) { /* ignore malformed keepalive frames */ }
                   }
                 }
 
                 setActivity(null);
                 if (streamError) throw new Error(streamError);
-                updateLastAssistantMessage(fullContent, true);
+                updateLastAssistantTurn(fullContent, true);
                 messageHistory.push({ role: 'assistant', content: fullContent });
                 totalTokens += Math.ceil(fullContent.length / 4);
-                tokenCounter.textContent = `Tokens generated: ${totalTokens}`;
+                tokenCounter.textContent = `${totalTokens} tokens generated`;
               } catch (error) {
                 setActivity(null);
-                updateLastAssistantMessage(`⚠️ ${error.message || 'Execution error.'}`, true);
+                const aborted = error.name === 'AbortError';
+                updateLastAssistantTurn(aborted ? '_Generation stopped._' : `Error: ${error.message || 'the request failed.'}`, true);
               }
 
-              sendButton.style.display = 'flex'; stopButton.style.display = 'none';
-              isStreaming = false; userInput.focus();
+              sendButton.style.display = 'flex';
+              stopButton.style.display = 'none';
+              isStreaming = false;
+              userInput.focus();
             }
 
-            userInput.addEventListener('keydown', function(e) {
+            sendButton.addEventListener('click', sendMessage);
+            userInput.addEventListener('keydown', (e) => {
               if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
                 sendMessage();
               }
             });
-            userInput.addEventListener('input', function() {
+            userInput.addEventListener('input', function () {
               this.style.height = 'auto';
               this.style.height = Math.min(this.scrollHeight, 200) + 'px';
             });
-            temperatureEl.addEventListener('input', function() {
-              document.getElementById('tempVal').textContent = this.value;
-            });
-            maxTokensEl.addEventListener('input', function() {
-              document.getElementById('tokenVal').textContent = this.value;
-            });
+            temperatureEl.addEventListener('input', function () { $('tempVal').textContent = this.value; });
+            maxTokensEl.addEventListener('input', function () { $('tokenVal').textContent = this.value; });
 
-            loadModels().then(() => {
-              renderInto(document.getElementById('welcomeMsg'), `**System ready.** Chat with any downloaded model. Attach an image and pick a vision model (llava, qwen2.5vl, deepseek-ocr) to have it described or read — Ollama does not generate images.`);
-            });
+            renderEmptyLog();
+            loadModels();
           </script>
           </body>
           </html>
@@ -1057,12 +1313,27 @@ jobs:
               uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
           PYEOF
           echo "✅ Server script written"
+          python3 -c "import ast; ast.parse(open('ollama_server.py').read())" && echo "✅ Python syntax OK"
 
       - name: 🌐 Start web server
         run: |
           nohup python ollama_server.py > /tmp/webui.log 2>&1 &
           echo $! > /tmp/webui.pid
-          sleep 3
+          echo "⏳ Waiting for web UI to report healthy..."
+          ready=false
+          for i in $(seq 1 20); do
+            if curl -sf "http://127.0.0.1:${PORT}/api/health" > /dev/null 2>&1; then
+              echo "✅ Web UI is live!"
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" != "true" ]; then
+            echo "❌ Web UI failed to start. Last logs:"
+            tail -n 80 /tmp/webui.log || true
+            exit 1
+          fi
 
       - name: 📦 Install cloudflared
         run: |
@@ -1089,7 +1360,7 @@ jobs:
           echo "║  🔗  $TUNNEL_URL"
           echo "╚═══════════════════════════════════════════════════════════════════╝"
           {
-            echo "## 🦙 Your Multimodal Web UI is live"
+            echo "## 🦙 Your Local Studio console is live"
             echo ""
             echo "**URL:** $TUNNEL_URL"
           } >> "$GITHUB_STEP_SUMMARY"
