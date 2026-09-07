@@ -56,7 +56,7 @@ jobs:
           pip install --no-cache-dir \
             fastapi uvicorn aiohttp httpx python-multipart \
             jinja2 websockets pydantic psutil \
-            "huggingface_hub[cli]"
+            huggingface_hub
           ollama --version
           python --version
       - name: 🚀 Start Ollama server
@@ -375,16 +375,19 @@ jobs:
                   try:
                       os.makedirs(target_dir, exist_ok=True)
                       
-                      # Fixed: Use huggingface-cli and pass HF_TOKEN to authenticate
-                      cmd = ["huggingface-cli", "download", repo_id, "--local-dir", target_dir]
+                      # Fixed: Use 'hf' CLI and inject HF_TOKEN into the subprocess environment
+                      cmd = ["hf", "download", repo_id, "--local-dir", target_dir]
+                      
+                      run_env = os.environ.copy()
                       if HF_TOKEN:
-                          cmd.extend(["--token", HF_TOKEN])
+                          run_env["HF_TOKEN"] = HF_TOKEN
 
                       process = subprocess.Popen(
                           cmd,
                           stdout=subprocess.PIPE,
                           stderr=subprocess.STDOUT,
-                          text=True
+                          text=True,
+                          env=run_env
                       )
                       for line in process.stdout:
                           line_str = line.strip()
