@@ -29,6 +29,7 @@ jobs:
       CONTEXT_SIZE: ${{ inputs.context_size }}
       PORT: ${{ inputs.port }}
       PIP_CACHE_DIR: ${{ github.workspace }}/.pip_cache
+      TMPDIR: ${{ github.workspace }}/.tmp
     steps:
       - name: 🚀 System Banner
         run: |
@@ -40,6 +41,7 @@ jobs:
           echo "  🏃 Runner:  $(uname -a)"
           echo "  💾 Memory:  $(free -h | awk '/Mem:/{print $2}')"
           echo "  🧠 CPUs:    $(nproc)"
+          mkdir -p $PIP_CACHE_DIR $TMPDIR
 
       - name: 🧹 Maximize Runner Storage (Creates 100GB Workspace)
         uses: easimon/maximize-build-space@master
@@ -55,9 +57,8 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: 📦 Install Web Dependencies to Workspace
+      - name: 📦 Install Web Dependencies
         run: |
-          mkdir -p $PIP_CACHE_DIR
           pip install --no-cache-dir fastapi uvicorn aiohttp httpx python-multipart jinja2 websockets pydantic psutil
 
       - name: 🦙 Install & Start Ollama Engine
@@ -81,15 +82,13 @@ jobs:
             sleep 2
           done
 
-      - name: 🎬 Install LongCat-Video Framework (To Workspace Drive)
+      - name: 🎬 Install LongCat-Video Framework
         run: |
           echo "──────────────────────────────────────────"
           echo " 🎬 Installing LongCat-Video Framework"
           echo "──────────────────────────────────────────"
           git clone --single-branch --branch main https://github.com/meituan-longcat/LongCat-Video.git
           cd LongCat-Video
-          
-          # Force pip to use workspace cache and local site-packages if needed
           pip install --no-cache-dir torch==2.6.0+cu124 torchvision==0.21.0+cu124 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
           pip install --no-cache-dir ninja packaging
           pip install --no-cache-dir -r requirements.txt
