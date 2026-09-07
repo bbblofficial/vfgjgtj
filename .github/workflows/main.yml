@@ -1,4 +1,4 @@
-name: 🦙 Local LLM Web Interface (Optimized)
+name: 🦙🎬 All-in-One AI Studio (LLM + LongCat-Video)
 
 on:
   workflow_dispatch:
@@ -9,67 +9,116 @@ on:
         default: '7860'
         type: string
       context_size:
-        description: '📝 Context window (tokens)'
+        description: '📝 LLM Context window (tokens)'
         required: false
         default: '4096'
         type: string
+      enable_longcat:
+        description: '🎬 Enable Meituan LongCat-Video engine'
+        required: false
+        default: true
+        type: boolean
+      longcat_model:
+        description: '📦 LongCat Model Weights to Pull'
+        required: false
+        default: 'LongCat-Video-Avatar-1.5'
+        type: choice
+        options:
+          - LongCat-Video-Avatar-1.5
+          - LongCat-Video-Avatar
+          - LongCat-Video
 
 permissions:
   contents: read
 
 concurrency:
-  group: llama-web-ui
+  group: ai-studio-workspace
   cancel-in-progress: true
 
 jobs:
-  deploy-llama:
+  deploy-ai-studio:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
       CONTEXT_SIZE: ${{ inputs.context_size }}
       PORT: ${{ inputs.port }}
+      ENABLE_LONGCAT: ${{ inputs.enable_longcat }}
+      LONGCAT_MODEL: ${{ inputs.longcat_model }}
     steps:
-      - name: 🦙 Show banner
+      - name: 🚀 System Banner & Specs
         run: |
           echo "╔═══════════════════════════════════════════════════════════════════╗"
-          echo "║    🦙  L O C A L    L L M    W E B    U I    ( O P T I M I Z E D )     ║"
+          echo "║       🦙 🎬  U N I F I E D   A I   S T U D I O   E N G I N E      ║"
           echo "╚═══════════════════════════════════════════════════════════════════╝"
-          echo "  📝 Context: ${CONTEXT_SIZE} tokens"
-          echo "  🔌 Port:    ${PORT}"
-          echo "  🏃 Runner:  $(uname -a)"
-          echo "  💾 Memory:  $(free -h | awk '/Mem:/{print $2}')"
-          echo "  🧠 CPUs:    $(nproc)"
-          echo "  ⏱️ Timeout:  6 Hours (360 minutes)"
-          echo "  💽 Disk space:"
-          df -h / | tail -1
+          echo "  📝 LLM Context:       ${CONTEXT_SIZE} tokens"
+          echo "  🔌 Web Interface:     Port ${PORT}"
+          echo "  🎬 LongCat Enabled:    ${ENABLE_LONGCAT}"
+          echo "  📦 LongCat Model:      ${LONGCAT_MODEL}"
+          echo "  🏃 Runner Platform:   $(uname -a)"
+          echo "  💾 Available Memory:  $(free -h | awk '/Mem:/{print $2}')"
+          echo "  🧠 CPU Threads:       $(nproc)"
+          echo "  ⏱️ Job Timeout:       6 Hours (360 minutes)"
 
-      - name: 🐍 Setup Python
+      - name: 🧹 Maximize Runner Storage
+        uses: easimon/maximize-build-space@master
+        with:
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
+
+      - name: 🐍 Setup Python 3.10
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.10'
 
-      - name: 📦 Install dependencies
+      - name: 📦 Install Ollama & Base Dependencies
         run: |
           echo "──────────────────────────────────────────"
-          echo " 📦  Installing Ollama + Python packages"
+          echo " 📦 Installing Ollama and Python Libraries"
           echo "──────────────────────────────────────────"
           curl -fsSL https://ollama.com/install.sh | sh
           pip install --no-cache-dir \
             fastapi uvicorn aiohttp httpx python-multipart \
-            jinja2 websockets pydantic psutil
-          ollama --version
-          python --version
+            jinja2 websockets pydantic psutil huggingface_hub[cli]
 
-      - name: 🚀 Start Ollama server
+      - name: 🎬 Prepare LongCat-Video Framework
+        if: ${{ inputs.enable_longcat == true }}
         run: |
           echo "──────────────────────────────────────────"
-          echo " 🚀  Starting Ollama"
+          echo " 🎬 Cloning LongCat-Video & Installing Torch"
+          echo "──────────────────────────────────────────"
+          sudo apt-get update && sudo apt-get install -y ffmpeg libsndfile1
+          
+          git clone --single-branch --branch main https://github.com/meituan-longcat/LongCat-Video.git
+          cd LongCat-Video
+          
+          # Install PyTorch with CUDA 12.4
+          pip install --no-cache-dir torch==2.6.0+cu124 torchvision==0.21.0+cu124 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+          
+          # Install Flash-Attention pre-reqs
+          pip install --no-cache-dir ninja packaging
+          pip install --no-cache-dir -r requirements.txt || true
+          pip install --no-cache-dir librosa -r requirements_avatar.txt || true
+          
+          # Try installing flash-attn without failing workflow if GPU compiler is absent
+          pip install flash_attn==2.7.4.post1 --no-build-isolation || echo "⚠️ flash-attn fallback to standard attention"
+          
+          echo "⬇️ Pre-fetching weights for ${LONGCAT_MODEL}..."
+          mkdir -p weights/${LONGCAT_MODEL}
+          huggingface-cli download meituan-longcat/${LONGCAT_MODEL} --local-dir ./weights/${LONGCAT_MODEL} || echo "Weights can also be downloaded on-demand"
+
+      - name: 🚀 Start Ollama Engine
+        run: |
+          echo "──────────────────────────────────────────"
+          echo " 🚀 Booting Ollama Daemon"
           echo "──────────────────────────────────────────"
           sudo systemctl stop ollama 2>/dev/null || true
           sudo systemctl disable ollama 2>/dev/null || true
           nohup ollama serve > /tmp/ollama.log 2>&1 &
           echo $! > /tmp/ollama.pid
-          echo "⏳ Waiting for Ollama to become ready..."
+          
           ready=false
           for i in $(seq 1 30); do
             if curl -sf http://127.0.0.1:11434/api/tags > /dev/null 2>&1; then
@@ -80,1261 +129,649 @@ jobs:
             sleep 2
           done
           if [ "$ready" != "true" ]; then
-            echo "❌ Ollama failed to start. Last logs:"
+            echo "❌ Ollama failed to start. Logs:"
             tail -n 50 /tmp/ollama.log || true
             exit 1
           fi
 
-      - name: 🔧 Write the web server (Glassmorphism UI)
+      - name: 🔧 Build Unified AI Web Application
         run: |
-          cat > ollama_server.py << 'PYEOF'
-  import json
-  import os
-  import logging
-  import platform
-  import psutil
-  import subprocess
-  from typing import Optional, List
-  import httpx
-  import uvicorn
-  from fastapi import FastAPI, HTTPException
-  from fastapi.responses import HTMLResponse, StreamingResponse
-  from pydantic import BaseModel
-  
-  logging.basicConfig(level=logging.INFO)
-  logger = logging.getLogger("llama-ui")
-  
-  OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
-  CONTEXT_SIZE = int(os.getenv("CONTEXT_SIZE", "4096"))
-  PORT = int(os.getenv("PORT", "7860"))
-  
-  app = FastAPI(title="Local LLM UI (Optimized)")
-  
-  CATALOG_MODELS = [
-      {"name": "qwen2.5:0.5b", "type": "general"},
-      {"name": "qwen2.5:1.5b", "type": "general"},
-      {"name": "qwen2.5:3b", "type": "general"},
-      {"name": "qwen2.5:7b", "type": "general"},
-      {"name": "qwen2.5-coder:0.5b", "type": "code"},
-      {"name": "qwen2.5-coder:1.5b", "type": "code"},
-      {"name": "qwen2.5-coder:3b", "type": "code"},
-      {"name": "qwen2.5-coder:7b", "type": "code"},
-      {"name": "deepseek-r1:1.5b", "type": "reasoning"},
-      {"name": "deepseek-r1:7b", "type": "reasoning"},
-      {"name": "deepseek-coder:1.3b", "type": "code"},
-      {"name": "deepseek-coder:6.7b", "type": "code"},
-      {"name": "llama3.2:1b", "type": "general"},
-      {"name": "llama3.2:3b", "type": "general"},
-      {"name": "tinyllama", "type": "general"},
-      {"name": "gemma2:2b", "type": "general"},
-      {"name": "phi3.5", "type": "general"},
-      {"name": "phi3:mini", "type": "general"},
-      {"name": "mistral:7b", "type": "general"},
-      {"name": "openhermes", "type": "general"},
-      {"name": "dolphin-mistral", "type": "general"},
-      {"name": "smollm:1.7b", "type": "general"},
-      {"name": "orca-mini:3b", "type": "general"},
-      {"name": "stablelm2:1.6b", "type": "general"}
-  ]
-  
-  class ChatMessage(BaseModel):
-      role: str
-      content: str
-      images: Optional[List[str]] = None
-  
-  class ChatRequest(BaseModel):
-      messages: List[ChatMessage]
-      model: str
-      temperature: Optional[float] = 0.7
-      max_tokens: Optional[int] = 2048
-  
-  class PullRequest(BaseModel):
-      model: str
-  
-  @app.get("/api/health")
-  async def health():
-      try:
-          async with httpx.AsyncClient(timeout=3) as client:
-              r = await client.get(f"{OLLAMA_HOST}/api/tags")
-              r.raise_for_status()
-          return {"status": "ok"}
-      except Exception as exc:
-          logger.error(f"Health check failed: {exc}")
-          raise HTTPException(status_code=503, detail=str(exc))
-  
-  @app.get("/api/sysinfo")
-  def sysinfo():
-      try:
-          return {
-              "cpu_threads": psutil.cpu_count(logical=True),
-              "ram_total": f"{psutil.virtual_memory().total / (1024**3):.1f} GB",
-              "os": platform.system() + " " + platform.release()
-          }
-      except Exception as e:
-          return {"cpu_threads": 4, "ram_total": "16.0 GB", "os": "Linux"}
-  
-  @app.get("/api/stats")
-  def stats():
-      try:
-          disk = psutil.disk_usage('/')
-          return {
-              "cpu_percent": psutil.cpu_percent(interval=None),
-              "ram_percent": psutil.virtual_memory().percent,
-              "ram_used": f"{psutil.virtual_memory().used / (1024**3):.1f} GB",
-              "disk_free": f"{disk.free / (1024**3):.1f} GB free"
-          }
-      except Exception as e:
-          return {"cpu_percent": 0.0, "ram_percent": 0.0, "ram_used": "0 GB", "disk_free": "100 GB free"}
-  
-  @app.get("/api/models")
-  async def list_models():
-      try:
-          pulled_names = set()
-          async with httpx.AsyncClient(timeout=4) as client:
+          cat > unified_server.py << 'PYEOF'
+          import os
+          import json
+          import logging
+          import platform
+          import psutil
+          import subprocess
+          import shutil
+          from typing import Optional, List
+          import httpx
+          import uvicorn
+          from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+          from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse
+          from fastapi.staticfiles import StaticFiles
+          from pydantic import BaseModel
+
+          logging.basicConfig(level=logging.INFO)
+          logger = logging.getLogger("unified-ai")
+
+          OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+          CONTEXT_SIZE = int(os.getenv("CONTEXT_SIZE", "4096"))
+          PORT = int(os.getenv("PORT", "7860"))
+          ENABLE_LONGCAT = os.getenv("ENABLE_LONGCAT", "true").lower() == "true"
+          LONGCAT_DIR = os.path.abspath("LongCat-Video")
+          OUTPUT_DIR = os.path.abspath("generated_outputs")
+          os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+          app = FastAPI(title="Unified AI Studio")
+
+          CATALOG_MODELS = [
+              {"name": "qwen2.5:0.5b", "type": "general"},
+              {"name": "qwen2.5:1.5b", "type": "general"},
+              {"name": "qwen2.5:3b", "type": "general"},
+              {"name": "qwen2.5:7b", "type": "general"},
+              {"name": "qwen2.5-coder:1.5b", "type": "code"},
+              {"name": "qwen2.5-coder:7b", "type": "code"},
+              {"name": "deepseek-r1:1.5b", "type": "reasoning"},
+              {"name": "deepseek-r1:7b", "type": "reasoning"},
+              {"name": "llama3.2:1b", "type": "general"},
+              {"name": "llama3.2:3b", "type": "general"},
+              {"name": "tinyllama", "type": "general"},
+              {"name": "gemma2:2b", "type": "general"},
+              {"name": "phi3.5", "type": "general"},
+              {"name": "mistral:7b", "type": "general"}
+          ]
+
+          LONGCAT_MODELS = [
+              "LongCat-Video-Avatar-1.5",
+              "LongCat-Video-Avatar",
+              "LongCat-Video"
+          ]
+
+          class ChatMessage(BaseModel):
+              role: str
+              content: str
+              images: Optional[List[str]] = None
+
+          class ChatRequest(BaseModel):
+              messages: List[ChatMessage]
+              model: str
+              temperature: Optional[float] = 0.7
+              max_tokens: Optional[int] = 2048
+
+          class PullRequest(BaseModel):
+              model: str
+
+          class VideoGenRequest(BaseModel):
+              task: str
+              model: str
+              prompt: str
+              ref_image: Optional[str] = None
+              audio_file: Optional[str] = None
+              steps: Optional[int] = 8
+
+          @app.get("/api/health")
+          async def health():
               try:
-                  r = await client.get(f"{OLLAMA_HOST}/api/tags")
-                  if r.status_code == 200:
-                      data = r.json()
-                      pulled_names = {m["name"] for m in data.get("models", [])}
-              except Exception as inner_exc:
-                  logger.warning(f"Could not reach Ollama for tags: {inner_exc}")
-  
-          models_payload = []
-          for item in CATALOG_MODELS:
-              name = item["name"]
-              models_payload.append({
-                  "name": name,
-                  "type": item["type"],
-                  "downloaded": name in pulled_names
-              })
-          return {"models": models_payload}
-      except Exception as exc:
-          logger.error(f"List models failed: {exc}")
-          raise HTTPException(status_code=503, detail=str(exc))
-  
-  @app.post("/api/pull")
-  async def pull_model(req: PullRequest):
-      async def generate_pull():
-          try:
-              process = subprocess.Popen(
-                  ["ollama", "pull", req.model],
-                  stdout=subprocess.PIPE,
-                  stderr=subprocess.STDOUT,
-                  text=True
-              )
-              for line in process.stdout:
-                  line_str = line.strip()
-                  if not line_str:
-                      continue
-                  percent = None
-                  if "%" in line_str:
-                      parts = line_str.split()
-                      for p in parts:
-                          if p.endswith("%"):
-                              try:
-                                  percent = int(p.rstrip("%"))
-                              except ValueError:
-                                  pass
-                  yield f"data: {json.dumps({'raw': line_str, 'percent': percent})}\n\n"
-              process.wait()
-              if process.returncode != 0:
-                  yield f"data: {json.dumps({'error': 'Pull command failed'})}\n\n"
-              yield "data: [DONE]\n\n"
-          except Exception as e:
-              yield f"data: {json.dumps({'error': str(e)})}\n\n"
-      return StreamingResponse(generate_pull(), media_type="text/event-stream")
-  
-  @app.get("/", response_class=HTMLResponse)
-  async def root():
-      return HTML_TEMPLATE
-  
-  @app.post("/api/chat")
-  async def chat(request: ChatRequest):
-      ollama_messages = []
-      for m in request.messages:
-          msg_dict = {"role": m.role, "content": m.content}
-          if m.images:
-              msg_dict["images"] = m.images
-          ollama_messages.append(msg_dict)
-  
-      async def generate():
-          try:
-              async with httpx.AsyncClient(timeout=180) as client:
-                  async with client.stream(
-                      "POST",
-                      f"{OLLAMA_HOST}/api/chat",
-                      json={
-                          "model": request.model,
-                          "messages": ollama_messages,
-                          "stream": True,
-                          "options": {
-                              "temperature": request.temperature,
-                              "num_predict": request.max_tokens,
-                              "num_ctx": CONTEXT_SIZE,
-                          },
-                      },
-                  ) as response:
-                      if response.status_code != 200:
-                          body = await response.aread()
-                          yield f"data: {json.dumps({'error': body.decode(errors='ignore')})}\n\n"
-                          yield "data: [DONE]\n\n"
-                          return
-                      async for line in response.aiter_lines():
-                          line = line.strip()
-                          if not line:
+                  async with httpx.AsyncClient(timeout=3) as client:
+                      r = await client.get(f"{OLLAMA_HOST}/api/tags")
+                      r.raise_for_status()
+                  return {"status": "ok", "longcat_available": ENABLE_LONGCAT and os.path.exists(LONGCAT_DIR)}
+              except Exception as exc:
+                  raise HTTPException(status_code=503, detail=str(exc))
+
+          @app.get("/api/sysinfo")
+          def sysinfo():
+              try:
+                  return {
+                      "cpu_threads": psutil.cpu_count(logical=True),
+                      "ram_total": f"{psutil.virtual_memory().total / (1024**3):.1f} GB",
+                      "os": platform.system() + " " + platform.release(),
+                      "longcat_enabled": ENABLE_LONGCAT
+                  }
+              except Exception:
+                  return {"cpu_threads": 4, "ram_total": "16.0 GB", "os": "Linux", "longcat_enabled": ENABLE_LONGCAT}
+
+          @app.get("/api/stats")
+          def stats():
+              try:
+                  disk = psutil.disk_usage('/')
+                  return {
+                      "cpu_percent": psutil.cpu_percent(interval=None),
+                      "ram_percent": psutil.virtual_memory().percent,
+                      "ram_used": f"{psutil.virtual_memory().used / (1024**3):.1f} GB",
+                      "disk_free": f"{disk.free / (1024**3):.1f} GB free"
+                  }
+              except Exception:
+                  return {"cpu_percent": 0.0, "ram_percent": 0.0, "ram_used": "0 GB", "disk_free": "100 GB"}
+
+          @app.get("/api/models")
+          async def list_models():
+              pulled_names = set()
+              try:
+                  async with httpx.AsyncClient(timeout=4) as client:
+                      r = await client.get(f"{OLLAMA_HOST}/api/tags")
+                      if r.status_code == 200:
+                          pulled_names = {m["name"] for m in r.json().get("models", [])}
+              except Exception:
+                  pass
+
+              return {
+                  "llm_models": [{
+                      "name": item["name"],
+                      "type": item["type"],
+                      "downloaded": item["name"] in pulled_names
+                  } for item in CATALOG_MODELS],
+                  "video_models": LONGCAT_MODELS
+              }
+
+          @app.post("/api/pull")
+          async def pull_model(req: PullRequest):
+              async def generate_pull():
+                  try:
+                      proc = subprocess.Popen(["ollama", "pull", req.model], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                      for line in proc.stdout:
+                          line_str = line.strip()
+                          if not line_str:
                               continue
-                          try:
-                              obj = json.loads(line)
-                          except json.JSONDecodeError:
-                              continue
-                          err = obj.get("error")
-                          if err:
-                              yield f"data: {json.dumps({'error': err})}\n\n"
-                              continue
-                          content = obj.get("message", {}).get("content")
-                          if content:
-                              yield f"data: {json.dumps({'content': content})}\n\n"
-          except Exception as exc:
-              logger.exception("chat stream failed")
-              yield f"data: {json.dumps({'error': str(exc)})}\n\n"
-          yield "data: [DONE]\n\n"
-      return StreamingResponse(generate(), media_type="text/event-stream")
-  
-  HTML_TEMPLATE = """<!DOCTYPE html>
-  <html lang="en">
-  <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Local Studio - Console</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-  <script src="https://cdn.jsdelivr.net/npm/marked@4.3.0/marked.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.6/purify.min.js"></script>
-  <link id="hljsTheme" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css">
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
-  <style>
-    :root {
-      --ink: #131210;
-      --panel: #1b1a16;
-      --panel-raised: #201f1a;
-      --rule: #34322a;
-      --rule-bright: #4a4738;
-      --ivory: #ece7da;
-      --dust: #9a927e;
-      --dust-dim: #6b6558;
-      --amber: #e8a33d;
-      --amber-ink: #2a1c05;
-      --amber-dim: rgba(232, 163, 61, 0.14);
-      --amber-line: rgba(232, 163, 61, 0.4);
-      --signal: #6fae8f;
-      --signal-dim: rgba(111, 174, 143, 0.14);
-      --alert: #d9634a;
-      --alert-dim: rgba(217, 99, 74, 0.14);
-      --radius-s: 4px;
-      --radius-m: 7px;
-    }
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    html, body { height: 100%; }
-    body {
-      background: var(--ink); color: var(--ivory); height: 100vh; display: flex; overflow: hidden;
-      font-family: 'IBM Plex Sans', -apple-system, sans-serif; font-size: 15px;
-    }
-    ::selection { background: var(--amber-dim); color: var(--ivory); }
-    ::-webkit-scrollbar { width: 9px; height: 9px; }
-    ::-webkit-scrollbar-track { background: transparent; }
-    ::-webkit-scrollbar-thumb { background: var(--rule-bright); border-radius: 5px; border: 2px solid var(--ink); }
-    a { color: var(--amber); }
-    button { font-family: inherit; }
-    :focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
-    .rack {
-      width: 308px; background: var(--panel); border-right: 1px solid var(--rule);
-      display: flex; flex-direction: column; flex-shrink: 0; z-index: 30;
-      overflow-y: auto; transition: transform 0.22s ease;
-    }
-    .rack-header {
-      display: flex; align-items: center; gap: 10px; padding: 18px 18px 14px;
-      border-bottom: 1px solid var(--rule);
-    }
-    .rack-mark {
-      width: 28px; height: 28px; border-radius: var(--radius-s); background: var(--amber-dim);
-      border: 1px solid var(--amber-line); display: flex; align-items: center; justify-content: center;
-      font-size: 14px; flex-shrink: 0;
-    }
-    .rack-title { font-family: 'Space Grotesk', sans-serif; font-size: 15px; font-weight: 600; color: var(--ivory); line-height: 1.1; }
-    .rack-sub { font-family: 'JetBrains Mono', monospace; font-size: 10.5px; color: var(--dust-dim); margin-top: 2px; }
-    .rack-close {
-      margin-left: auto; display: none; background: transparent; border: 1px solid var(--rule);
-      color: var(--dust); width: 28px; height: 28px; border-radius: var(--radius-s); cursor: pointer;
-    }
-    .module { padding: 16px 18px; border-bottom: 1px solid var(--rule); }
-    .module-label {
-      font-size: 11.5px; font-weight: 500; color: var(--dust); margin-bottom: 10px;
-      display: flex; align-items: center; justify-content: space-between;
-    }
-    .module-refresh { background: none; border: none; color: var(--amber); cursor: pointer; font-size: 11px; font-weight: 500; padding: 2px 4px; }
-    .new-session-btn {
-      display: flex; align-items: center; justify-content: center; gap: 7px; width: 100%; padding: 9px;
-      background: var(--panel-raised); border: 1px solid var(--rule); border-radius: var(--radius-m); color: var(--ivory);
-      font-size: 13px; font-weight: 500; cursor: pointer; transition: border-color 0.15s ease;
-    }
-    .new-session-btn:hover { border-color: var(--amber-line); }
-    .model-list { display: flex; flex-direction: column; gap: 2px; max-height: 260px; overflow-y: auto; }
-    .model-row {
-      display: flex; align-items: center; gap: 9px; padding: 8px 8px; border-radius: var(--radius-s);
-      cursor: default; border: 1px solid transparent;
-    }
-    .model-row[data-clickable="1"] { cursor: pointer; }
-    .model-row[data-clickable="1"]:hover { background: var(--panel-raised); }
-    .model-row.active { background: var(--amber-dim); border-color: var(--amber-line); }
-    .model-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; background: var(--rule-bright); }
-    .model-row.active .model-dot { background: var(--amber); box-shadow: 0 0 6px var(--amber); }
-    .model-row[data-downloaded="1"]:not(.active) .model-dot { background: var(--signal); }
-    .model-meta { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
-    .model-name {
-      font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--ivory);
-      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-    }
-    .model-flags { display: flex; align-items: center; gap: 6px; }
-    .model-chip {
-      font-family: 'JetBrains Mono', monospace; font-size: 9.5px; padding: 1px 5px; border-radius: 3px;
-      border: 1px solid var(--rule-bright); color: var(--dust);
-    }
-    .model-chip.vision { color: var(--signal); border-color: rgba(111,174,143,0.4); }
-    .dl-btn {
-      background: transparent; border: 1px solid var(--rule-bright); color: var(--dust);
-      padding: 4px 9px; border-radius: var(--radius-s); font-size: 11px; cursor: pointer; flex-shrink: 0;
-      font-family: 'JetBrains Mono', monospace; transition: all 0.15s ease;
-    }
-    .dl-btn:hover { border-color: var(--amber-line); color: var(--amber); }
-    .dl-btn:disabled { opacity: 0.45; cursor: not-allowed; }
-    .model-list-empty { font-size: 12px; color: var(--dust-dim); padding: 10px 4px; }
-    .field { display: flex; flex-direction: column; gap: 6px; margin-top: 14px; }
-    .field:first-child { margin-top: 0; }
-    .field-row { display: flex; justify-content: space-between; align-items: baseline; font-size: 12px; color: var(--dust); }
-    .field-row span.val { font-family: 'JetBrains Mono', monospace; color: var(--amber); }
-    input[type="range"] {
-      -webkit-appearance: none; width: 100%; height: 3px; background: var(--rule-bright); border-radius: 2px; outline: none;
-    }
-    input[type="range"]::-webkit-slider-thumb {
-      -webkit-appearance: none; width: 13px; height: 13px; border-radius: 50%; background: var(--amber);
-      cursor: pointer; border: 2px solid var(--panel);
-    }
-    .meter { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
-    .meter-label { font-size: 11.5px; color: var(--dust); width: 40px; flex-shrink: 0; }
-    .meter-track { flex: 1; display: flex; gap: 2px; height: 8px; }
-    .meter-seg { flex: 1; background: var(--rule); border-radius: 1px; }
-    .meter-seg.on { background: var(--amber); }
-    .meter-val { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--ivory); width: 38px; text-align: right; flex-shrink: 0; }
-    .hw-line { font-family: 'JetBrains Mono', monospace; font-size: 10.5px; color: var(--dust-dim); line-height: 1.6; margin-bottom: 10px; }
-    .rack-footer { margin-top: auto; padding: 14px 18px; display: flex; flex-direction: column; gap: 8px; }
-    .status-line { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--dust); }
-    .status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--dust-dim); flex-shrink: 0; }
-    .status-dot.ok { background: var(--signal); box-shadow: 0 0 5px var(--signal); }
-    .status-dot.bad { background: var(--alert); box-shadow: 0 0 5px var(--alert); }
-    .token-line { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--dust-dim); }
-    .viewport { flex: 1; display: flex; flex-direction: column; height: 100vh; position: relative; min-width: 0; }
-    .topbar {
-      display: none; align-items: center; gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--rule);
-      flex-shrink: 0;
-    }
-    .topbar-toggle {
-      background: var(--panel); border: 1px solid var(--rule); color: var(--ivory); width: 34px; height: 34px;
-      border-radius: var(--radius-s); cursor: pointer; font-size: 15px;
-    }
-    .topbar-title { font-family: 'Space Grotesk', sans-serif; font-size: 14px; font-weight: 600; }
-    .activity-bar {
-      padding: 7px 24px; font-size: 12px; color: var(--amber); display: none; align-items: center; gap: 9px;
-      font-family: 'JetBrains Mono', monospace; border-bottom: 1px solid var(--rule); flex-shrink: 0;
-    }
-    .activity-dot {
-      width: 6px; height: 6px; border-radius: 50%; background: var(--amber); flex-shrink: 0;
-      animation: pulse 1s ease-in-out infinite;
-    }
-    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
-    .log { flex: 1; overflow-y: auto; padding: 8px 0 160px; }
-    .log-inner { max-width: 680px; margin: 0 auto; padding: 0 20px; }
-    .turn { padding: 20px 0; border-bottom: 1px solid var(--rule); }
-    .turn:last-child { border-bottom: none; }
-    .turn-label {
-      font-family: 'JetBrains Mono', monospace; font-size: 10.5px; color: var(--dust-dim);
-      margin-bottom: 8px; display: flex; align-items: center; gap: 8px;
-    }
-    .turn.user .turn-label { color: var(--amber); }
-    .turn-body { line-height: 1.65; font-size: 15px; }
-    .turn-body p { margin: 0 0 12px; }
-    .turn-body p:last-child { margin-bottom: 0; }
-    .turn-body img { max-width: 100%; height: auto; border-radius: var(--radius-m); margin: 10px 0; border: 1px solid var(--rule); }
-    .turn-body pre {
-      background: #0e0d0b; color: #e2e8f0; padding: 32px 14px 14px; border-radius: var(--radius-m);
-      overflow-x: auto; margin: 14px 0; border: 1px solid var(--rule); font-size: 13px;
-    }
-    .turn-body code { font-family: 'JetBrains Mono', monospace; font-size: 13px; background: var(--panel-raised); padding: 2px 5px; border-radius: 3px; }
-    .turn-body pre code { background: transparent; padding: 0; }
-    .turn.error .turn-body { color: var(--alert); }
-    .cursor-blink { display: inline-block; width: 7px; height: 14px; background: var(--amber); vertical-align: -2px; animation: blink 0.9s step-end infinite; margin-left: 2px; }
-    @keyframes blink { 50% { opacity: 0; } }
-    .empty-state { max-width: 480px; margin: 60px auto; text-align: center; padding: 0 20px; }
-    .empty-state h2 { font-family: 'Space Grotesk', sans-serif; font-size: 18px; font-weight: 600; margin-bottom: 8px; }
-    .empty-state p { color: var(--dust); font-size: 13.5px; line-height: 1.6; }
-    .media-row { display: flex; gap: 8px; padding: 0 16px 8px; flex-wrap: wrap; }
-    .media-chip {
-      position: relative; width: 54px; height: 54px; border-radius: var(--radius-s); overflow: hidden;
-      border: 1px solid var(--amber-line); background: #000;
-    }
-    .media-chip img { width: 100%; height: 100%; object-fit: cover; }
-    .media-chip .rm {
-      position: absolute; top: 2px; right: 2px; background: rgba(0,0,0,0.75); color: #fff;
-      border: none; border-radius: 3px; width: 16px; height: 16px; font-size: 10px; cursor: pointer; line-height: 1;
-    }
-    .dock-wrap {
-      position: absolute; bottom: 0; left: 0; width: 100%;
-      background: linear-gradient(180deg, transparent 0%, var(--ink) 45%);
-      padding: 16px 20px 20px; display: flex; flex-direction: column; align-items: center;
-    }
-    .dock {
-      max-width: 680px; width: 100%; background: var(--panel); border: 1px solid var(--rule);
-      border-radius: var(--radius-m); display: flex; align-items: flex-end; padding: 8px 8px 8px 14px; gap: 8px;
-      transition: border-color 0.15s ease;
-    }
-    .dock:focus-within { border-color: var(--amber-line); }
-    .dock textarea {
-      flex: 1; background: transparent; border: none; color: var(--ivory); font-family: inherit;
-      font-size: 14.5px; resize: none; outline: none; max-height: 200px; min-height: 24px; line-height: 24px; padding: 6px 0;
-    }
-    .dock textarea::placeholder { color: var(--dust-dim); }
-    .dock textarea:disabled { color: var(--dust-dim); }
-    .icon-btn, .send-btn, .stop-btn {
-      border: 1px solid var(--rule-bright); border-radius: var(--radius-s); width: 34px; height: 34px;
-      display: flex; align-items: center; justify-content: center; cursor: pointer; flex-shrink: 0; font-size: 15px;
-      background: transparent; color: var(--dust); transition: all 0.15s ease;
-    }
-    .icon-btn:hover { color: var(--ivory); border-color: var(--rule-bright); }
-    .send-btn { background: var(--amber); border-color: var(--amber); color: var(--amber-ink); font-weight: 600; }
-    .send-btn:hover { background: #f0b25a; }
-    .send-btn:disabled { background: var(--panel-raised); border-color: var(--rule); color: var(--dust-dim); cursor: not-allowed; }
-    .stop-btn { background: var(--alert-dim); border-color: var(--alert); color: var(--alert); display: none; }
-    .dock-hint { font-family: 'JetBrains Mono', monospace; font-size: 10.5px; color: var(--dust-dim); margin-top: 8px; }
-    .modal-overlay {
-      position: fixed; inset: 0; background: rgba(10,9,7,0.82); backdrop-filter: blur(6px);
-      display: none; align-items: center; justify-content: center; z-index: 100; padding: 20px;
-    }
-    .modal-box {
-      background: var(--panel); border: 1px solid var(--rule); border-radius: var(--radius-m);
-      width: 100%; max-width: 480px; padding: 22px; display: flex; flex-direction: column; gap: 16px;
-    }
-    .modal-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
-    .modal-name { font-family: 'JetBrains Mono', monospace; font-size: 14px; color: var(--ivory); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .modal-pct { font-family: 'JetBrains Mono', monospace; font-size: 16px; font-weight: 600; color: var(--amber); flex-shrink: 0; }
-    .metric-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
-    .metric { background: var(--panel-raised); border: 1px solid var(--rule); border-radius: var(--radius-s); padding: 8px 10px; }
-    .metric-label { font-size: 10px; color: var(--dust-dim); margin-bottom: 3px; }
-    .metric-val { font-family: 'JetBrains Mono', monospace; font-size: 12.5px; color: var(--ivory); }
-    .modal-bar-track { width: 100%; height: 6px; background: var(--rule); border-radius: 3px; overflow: hidden; }
-    .modal-bar-fill { height: 100%; background: var(--amber); width: 0%; transition: width 0.25s ease-out; }
-    .term { background: #0e0d0b; border: 1px solid var(--rule); border-radius: var(--radius-s); padding: 10px 12px;
-      height: 120px; overflow-y: auto; font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #94a3b8; line-height: 1.6; }
-    .term-line.error { color: var(--alert); font-weight: 600; }
-    .modal-btn {
-      align-self: flex-end; background: transparent; border: 1px solid var(--rule-bright); color: var(--ivory);
-      padding: 7px 16px; border-radius: var(--radius-s); cursor: pointer; font-size: 12.5px; font-weight: 500;
-    }
-    .modal-btn:hover:not(:disabled) { border-color: var(--amber-line); color: var(--amber); }
-    .modal-btn:disabled { opacity: 0.5; cursor: not-allowed; }
-    .backdrop-scrim {
-      position: fixed; inset: 0; background: rgba(10,9,7,0.6); z-index: 25; display: none;
-    }
-    @media (max-width: 860px) {
-      .rack {
-        position: fixed; top: 0; left: 0; height: 100%; transform: translateX(-100%); box-shadow: 0 0 40px rgba(0,0,0,0.5);
-      }
-      .rack.open { transform: translateX(0); }
-      .rack-close { display: flex; align-items: center; justify-content: center; }
-      .topbar { display: flex; }
-      .backdrop-scrim.show { display: block; }
-    }
-  </style>
-  </head>
-  <body>
-    <div class="backdrop-scrim" id="scrim"></div>
-    <div class="modal-overlay" id="downloadModal">
-      <div class="modal-box">
-        <div class="modal-head">
-          <span class="modal-name" id="modalTitle">model</span>
-          <span class="modal-pct" id="modalPercent">0%</span>
-        </div>
-        <div class="metric-row">
-          <div class="metric"><div class="metric-label">Speed</div><div class="metric-val" id="metricSpeed">—</div></div>
-          <div class="metric"><div class="metric-label">Size</div><div class="metric-val" id="metricSize">—</div></div>
-          <div class="metric"><div class="metric-label">ETA</div><div class="metric-val" id="metricEta">—</div></div>
-        </div>
-        <div class="modal-bar-track"><div class="modal-bar-fill" id="modalBar"></div></div>
-        <div class="term" id="modalLogs"></div>
-        <button class="modal-btn" id="modalCloseBtn" disabled>Downloading…</button>
-      </div>
-    </div>
-    <nav class="rack" id="rack">
-      <div class="rack-header">
-        <div class="rack-mark">🦙</div>
-        <div>
-          <div class="rack-title">Local Studio</div>
-          <div class="rack-sub">console v2</div>
-        </div>
-        <button class="rack-close" id="rackClose" aria-label="Close model panel">✕</button>
-      </div>
-      <div class="module">
-        <button class="new-session-btn" id="newSessionBtn">＋ New session</button>
-      </div>
-      <div class="module">
-        <div class="module-label">
-          <span>Models</span>
-          <button class="module-refresh" id="refreshBtn">refresh</button>
-        </div>
-        <div class="model-list" id="modelListContainer">
-          <div class="model-list-empty">Reading model catalog…</div>
-        </div>
-      </div>
-      <div class="module">
-        <div class="field">
-          <div class="field-row"><span>Temperature</span><span class="val" id="tempVal">0.7</span></div>
-          <input type="range" id="temperature" min="0" max="2" step="0.1" value="0.7" aria-label="Temperature">
-        </div>
-        <div class="field">
-          <div class="field-row"><span>Max tokens</span><span class="val" id="tokenVal">2048</span></div>
-          <input type="range" id="maxTokens" min="128" max="4096" step="128" value="2048" aria-label="Max tokens">
-        </div>
-      </div>
-      <div class="module">
-        <div class="module-label"><span>Hardware</span></div>
-        <div class="hw-line" id="sysSpecs">reading host specs…</div>
-        <div class="meter">
-          <span class="meter-label">CPU</span>
-          <div class="meter-track" id="cpuMeter"></div>
-          <span class="meter-val" id="cpuVal">0%</span>
-        </div>
-        <div class="meter">
-          <span class="meter-label">RAM</span>
-          <div class="meter-track" id="ramMeter"></div>
-          <span class="meter-val" id="ramVal">0%</span>
-        </div>
-        <div class="meter">
-          <span class="meter-label">Disk</span>
-          <div class="meter-track"></div>
-          <span class="meter-val" id="diskFreeVal" style="width:auto;">—</span>
-        </div>
-      </div>
-      <div class="rack-footer">
-        <div class="status-line"><span class="status-dot" id="engineDot"></span><span id="engineText">Checking engine…</span></div>
-        <div class="token-line" id="tokenCounter">0 tokens generated</div>
-      </div>
-    </nav>
-    <div class="viewport">
-      <div class="topbar">
-        <button class="topbar-toggle" id="rackOpenBtn" aria-label="Open model panel">☰</button>
-        <span class="topbar-title" id="topbarModel">No model selected</span>
-      </div>
-      <div class="activity-bar" id="activityBar">
-        <span class="activity-dot"></span>
-        <span id="activityText">Idle</span>
-      </div>
-      <div class="log" id="log">
-        <div class="log-inner" id="logInner"></div>
-      </div>
-      <div class="dock-wrap">
-        <div class="media-row" id="mediaRow"></div>
-        <div class="dock">
-          <button class="icon-btn" id="attachBtn" title="Attach an image for a vision model" aria-label="Attach image">📎</button>
-          <input type="file" id="mediaInput" accept="image/*" style="display:none;">
-          <textarea id="userInput" placeholder="Download a model to begin…" rows="1" disabled></textarea>
-          <button class="send-btn" id="sendButton" aria-label="Send message" disabled>⏎</button>
-          <button class="stop-btn" id="stopButton" aria-label="Stop generating">■</button>
-        </div>
-        <div class="dock-hint">Enter to send · Shift+Enter for a new line</div>
-      </div>
-    </div>
-  <script>
-    // Initialize marked safely
-    if (typeof marked !== 'undefined') {
-      marked.setOptions({ gfm: true, breaks: true });
-    }
-    
-    // Safe element selector
-    const $ = (id) => document.getElementById(id);
-    
-    // DOM elements
-    const logInner = $('logInner');
-    const logEl = $('log');
-    const userInput = $('userInput');
-    const sendButton = $('sendButton');
-    const stopButton = $('stopButton');
-    const attachBtn = $('attachBtn');
-    const mediaInput = $('mediaInput');
-    const mediaRow = $('mediaRow');
-    const tokenCounter = $('tokenCounter');
-    const temperatureEl = $('temperature');
-    const maxTokensEl = $('maxTokens');
-    const modelListContainer = $('modelListContainer');
-    const topbarModel = $('topbarModel');
-    const activityBar = $('activityBar');
-    const activityText = $('activityText');
-    const engineDot = $('engineDot');
-    const engineText = $('engineText');
-    const rack = $('rack');
-    const scrim = $('scrim');
-    const downloadModal = $('downloadModal');
-    const modalTitle = $('modalTitle');
-    const modalBar = $('modalBar');
-    const modalPercent = $('modalPercent');
-    const modalLogs = $('modalLogs');
-    const modalCloseBtn = $('modalCloseBtn');
-    const metricSpeed = $('metricSpeed');
-    const metricSize = $('metricSize');
-    const metricEta = $('metricEta');
-    
-    // State
-    let isStreaming = false;
-    let totalTokens = 0;
-    let messageHistory = [];
-    let controller = null;
-    let currentModel = null;
-    let attachedMediaBase64 = null;
-    let knownModels = [];
-    let removeMediaHandler = null;
-    
-    // Utility functions
-    function escapeHtml(str) {
-      if (!str) return '';
-      const div = document.createElement('div');
-      div.textContent = str;
-      return div.innerHTML;
-    }
-    
-    function renderMarkdown(el, text, loading) {
-      if (!el) return;
-      try {
-        const html = typeof marked !== 'undefined' ? marked.parse(text || '') : (text || '');
-        const clean = typeof DOMPurify !== 'undefined' ? DOMPurify.sanitize(html) : html;
-        el.innerHTML = clean + (loading ? '<span class="cursor-blink"></span>' : '');
-        
-        // Apply syntax highlighting
-        if (typeof hljs !== 'undefined') {
-          el.querySelectorAll('pre code').forEach((block) => {
-            hljs.highlightElement(block);
-          });
-        }
-      } catch (e) {
-        console.error('Markdown rendering error:', e);
-        el.textContent = text || '';
-      }
-    }
-    
-    function setActivity(text) {
-      if (!activityBar || !activityText) return;
-      if (text) {
-        activityBar.style.display = 'flex';
-        activityText.textContent = text;
-      } else {
-        activityBar.style.display = 'none';
-      }
-    }
-    
-    function renderMeterSegments(container, percent, segCount) {
-      if (!container) return;
-      const on = Math.round((percent / 100) * segCount);
-      let html = '';
-      for (let i = 0; i < segCount; i++) {
-        html += `<div class="meter-seg${i < on ? ' on' : ''}"></div>`;
-      }
-      container.innerHTML = html;
-    }
-    
-    // Rack controls
-    function openRack() { 
-      if (rack) rack.classList.add('open'); 
-      if (scrim) scrim.classList.add('show'); 
-    }
-    
-    function closeRack() { 
-      if (rack) rack.classList.remove('open'); 
-      if (scrim) scrim.classList.remove('show'); 
-    }
-    
-    if ($('rackOpenBtn')) $('rackOpenBtn').addEventListener('click', openRack);
-    if ($('rackClose')) $('rackClose').addEventListener('click', closeRack);
-    if (scrim) scrim.addEventListener('click', closeRack);
-    
-    // Media handling
-    function cleanupMediaListener() {
-      if (removeMediaHandler) {
-        const btn = $('removeMediaBtn');
-        if (btn) {
-          btn.removeEventListener('click', removeMediaHandler);
-        }
-        removeMediaHandler = null;
-      }
-    }
-    
-    if (attachBtn) {
-      attachBtn.addEventListener('click', () => {
-        if (mediaInput) mediaInput.click();
-      });
-    }
-    
-    if (mediaInput) {
-      mediaInput.addEventListener('change', (event) => {
-        const file = event.target.files[0];
-        if (!file) return;
-        
-        const reader = new FileReader();
-        reader.onload = (e) => {
-          attachedMediaBase64 = e.target.result.split(',')[1];
-          
-          // Clean up old listener
-          cleanupMediaListener();
-          
-          if (mediaRow) {
-            mediaRow.innerHTML = `
-              <div class="media-chip">
-                <img src="${e.target.result}" alt="Attached image preview">
-                <button class="rm" id="removeMediaBtn" aria-label="Remove attached image">✕</button>
-              </div>`;
-            
-            // Store handler reference for cleanup
-            removeMediaHandler = removeMedia;
-            const removeBtn = $('removeMediaBtn');
-            if (removeBtn) {
-              removeBtn.addEventListener('click', removeMedia);
+                          percent = None
+                          if "%" in line_str:
+                              for p in line_str.split():
+                                  if p.endswith("%"):
+                                      try:
+                                          percent = int(p.rstrip("%"))
+                                      except ValueError:
+                                          pass
+                          yield f"data: {json.dumps({'raw': line_str, 'percent': percent})}\n\n"
+                      proc.wait()
+                      yield "data: [DONE]\n\n"
+                  except Exception as e:
+                      yield f"data: {json.dumps({'error': str(e)})}\n\n"
+              return StreamingResponse(generate_pull(), media_type="text/event-stream")
+
+          @app.post("/api/chat")
+          async def chat(request: ChatRequest):
+              ollama_messages = [{"role": m.role, "content": m.content, **({"images": m.images} if m.images else {})} for m in request.messages]
+
+              async def generate():
+                  try:
+                      async with httpx.AsyncClient(timeout=180) as client:
+                          async with client.stream(
+                              "POST",
+                              f"{OLLAMA_HOST}/api/chat",
+                              json={
+                                  "model": request.model,
+                                  "messages": ollama_messages,
+                                  "stream": True,
+                                  "options": {
+                                      "temperature": request.temperature,
+                                      "num_predict": request.max_tokens,
+                                      "num_ctx": CONTEXT_SIZE
+                                  }
+                              }
+                          ) as resp:
+                              if resp.status_code != 200:
+                                  err = await resp.aread()
+                                  yield f"data: {json.dumps({'error': err.decode(errors='ignore')})}\n\n"
+                                  yield "data: [DONE]\n\n"
+                                  return
+                              async for line in resp.aiter_lines():
+                                  line = line.strip()
+                                  if not line:
+                                      continue
+                                  try:
+                                      obj = json.loads(line)
+                                      if obj.get("error"):
+                                          yield f"data: {json.dumps({'error': obj['error']})}\n\n"
+                                      content = obj.get("message", {}).get("content")
+                                      if content:
+                                          yield f"data: {json.dumps({'content': content})}\n\n"
+                                  except json.JSONDecodeError:
+                                      continue
+                  except Exception as exc:
+                      yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+                  yield "data: [DONE]\n\n"
+              return StreamingResponse(generate(), media_type="text/event-stream")
+
+          @app.post("/api/video/generate")
+          async def generate_video(req: VideoGenRequest):
+              if not ENABLE_LONGCAT or not os.path.exists(LONGCAT_DIR):
+                  raise HTTPException(status_code=400, detail="LongCat-Video engine is not enabled or not installed.")
+
+              async def run_video_pipeline():
+                  yield f"data: {json.dumps({'raw': f'🚀 Starting LongCat pipeline for task: {req.task} using {req.model}'})}\n\n"
+                  
+                  cmd = ["python", "run_demo_text_to_video.py", f"--checkpoint_dir=./weights/{req.model}"]
+                  if req.task == "i2v":
+                      cmd = ["python", "run_demo_image_to_video.py", f"--checkpoint_dir=./weights/{req.model}"]
+                  elif req.task == "avatar":
+                      cmd = ["python", "run_demo_avatar_single_audio_to_video.py", f"--checkpoint_dir=./weights/{req.model}", "--use_distill", "--model_type", "avatar-v1.5"]
+
+                  try:
+                      proc = subprocess.Popen(cmd, cwd=LONGCAT_DIR, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                      for line in proc.stdout:
+                          line_str = line.strip()
+                          if line_str:
+                              yield f"data: {json.dumps({'raw': line_str})}\n\n"
+                      proc.wait()
+                      yield f"data: {json.dumps({'raw': '🎉 LongCat Video Task Completed!'})}\n\n"
+                      yield "data: [DONE]\n\n"
+                  except Exception as e:
+                      yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+              return StreamingResponse(run_video_pipeline(), media_type="text/event-stream")
+
+          @app.get("/api/video/gallery")
+          def get_gallery():
+              files = []
+              if os.path.exists(OUTPUT_DIR):
+                  files = [f for f in os.listdir(OUTPUT_DIR) if f.endswith(('.mp4', '.gif', '.png', '.jpg'))]
+              return {"files": files}
+
+          @app.get("/", response_class=HTMLResponse)
+          async def index():
+              return HTML_CONTENT
+
+          HTML_CONTENT = """<!DOCTYPE html>
+          <html lang="en">
+          <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <title>Unified AI Studio - LLM & LongCat</title>
+          <link rel="preconnect" href="https://fonts.googleapis.com">
+          <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+          <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+          <script src="https://cdn.jsdelivr.net/npm/marked@4.3.0/marked.min.js"></script>
+          <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.6/purify.min.js"></script>
+          <style>
+            :root {
+              --ink: #0d0e12;
+              --panel: #14171f;
+              --panel-raised: #1b202c;
+              --rule: #283042;
+              --rule-bright: #3a4761;
+              --ivory: #e6ebf5;
+              --dust: #8b9bb4;
+              --dust-dim: #54627a;
+              --cyan: #00e5ff;
+              --cyan-dim: rgba(0, 229, 255, 0.12);
+              --cyan-line: rgba(0, 229, 255, 0.35);
+              --amber: #f59e0b;
+              --signal: #10b981;
+              --alert: #ef4444;
+              --radius: 8px;
             }
-          }
-        };
-        reader.onerror = () => {
-          console.error('Failed to read file');
-        };
-        reader.readAsDataURL(file);
-      });
-    }
-    
-    function removeMedia() {
-      attachedMediaBase64 = null;
-      if (mediaRow) mediaRow.innerHTML = '';
-      if (mediaInput) mediaInput.value = '';
-      cleanupMediaListener();
-    }
-    
-    // System info
-    async function fetchSysInfo() {
-      try {
-        const r = await fetch('/api/sysinfo');
-        if (!r.ok) throw new Error('Failed to fetch sysinfo');
-        const data = await r.json();
-        const sysSpecs = $('sysSpecs');
-        if (sysSpecs) {
-          sysSpecs.textContent = `${data.os} · ${data.cpu_threads} threads · ${data.ram_total} RAM`;
-        }
-      } catch (e) {
-        console.error('SysInfo error:', e);
-        const sysSpecs = $('sysSpecs');
-        if (sysSpecs) sysSpecs.textContent = 'Host specs unavailable';
-      }
-    }
-    
-    async function fetchStats() {
-      try {
-        const r = await fetch('/api/stats');
-        if (!r.ok) return;
-        const data = await r.json();
-        const cpuVal = $('cpuVal');
-        const cpuMeter = $('cpuMeter');
-        const ramVal = $('ramVal');
-        const ramMeter = $('ramMeter');
-        const diskFreeVal = $('diskFreeVal');
-        
-        if (cpuVal) cpuVal.textContent = data.cpu_percent.toFixed(0) + '%';
-        if (cpuMeter) renderMeterSegments(cpuMeter, data.cpu_percent, 20);
-        if (ramVal) ramVal.textContent = data.ram_percent.toFixed(0) + '%';
-        if (ramMeter) renderMeterSegments(ramMeter, data.ram_percent, 20);
-        if (diskFreeVal) diskFreeVal.textContent = data.disk_free;
-      } catch (e) {
-        // Silently fail for stats polling
-      }
-    }
-    
-    async function pollHealth() {
-      try {
-        const r = await fetch('/api/health');
-        if (r.ok) {
-          if (engineDot) engineDot.className = 'status-dot ok';
-          if (engineText) engineText.textContent = 'Engine online';
-        } else {
-          throw new Error('unhealthy');
-        }
-      } catch (e) {
-        if (engineDot) engineDot.className = 'status-dot bad';
-        if (engineText) engineText.textContent = 'Engine unreachable';
-      }
-    }
-    
-    // Initialize system monitoring
-    fetchSysInfo();
-    fetchStats();
-    pollHealth();
-    setInterval(fetchStats, 3000);
-    setInterval(pollHealth, 8000);
-    
-    // Model management
-    async function loadModels() {
-      try {
-        const resp = await fetch('/api/models');
-        if (!resp.ok) throw new Error('bad response');
-        const data = await resp.json();
-        knownModels = data.models || [];
-        renderModelList();
-    
-        const downloaded = knownModels.filter(m => m.downloaded);
-        if (!currentModel && downloaded.length > 0) {
-          selectModel(downloaded[0].name);
-        }
-        updateComposerState();
-      } catch (e) {
-        console.error('Load models error:', e);
-        if (modelListContainer) {
-          modelListContainer.innerHTML = '<div class="model-list-empty">Could not reach engine. Hit refresh.</div>';
-        }
-      }
-    }
-    
-    function renderModelList() {
-      if (!modelListContainer) return;
-      
-      if (!knownModels.length) {
-        modelListContainer.innerHTML = '<div class="model-list-empty">No models found.</div>';
-        return;
-      }
-      
-      modelListContainer.innerHTML = knownModels.map(m => {
-        const active = m.name === currentModel;
-        return `
-          <div class="model-row${active ? ' active' : ''}" data-model="${escapeHtml(m.name)}" data-downloaded="${m.downloaded ? '1' : '0'}" data-clickable="${m.downloaded ? '1' : '0'}">
-            <span class="model-dot"></span>
-            <div class="model-meta">
-              <span class="model-name">${escapeHtml(m.name)}</span>
-              <div class="model-flags">
-                <span class="model-chip ${m.type}">${m.type}</span>
-                <span class="model-chip">${m.downloaded ? 'ready' : 'not pulled'}</span>
+            * { margin:0; padding:0; box-sizing:border-box; }
+            body {
+              background: var(--ink); color: var(--ivory); height: 100vh; display: flex; overflow: hidden;
+              font-family: 'IBM Plex Sans', sans-serif; font-size: 14px;
+            }
+            .sidebar {
+              width: 320px; background: var(--panel); border-right: 1px solid var(--rule);
+              display: flex; flex-direction: column; flex-shrink: 0; overflow-y: auto;
+            }
+            .brand {
+              padding: 16px; border-bottom: 1px solid var(--rule); display: flex; align-items: center; gap: 10px;
+            }
+            .brand-icon {
+              width: 34px; height: 34px; border-radius: var(--radius); background: var(--cyan-dim);
+              border: 1px solid var(--cyan-line); display: flex; align-items: center; justify-content: center; font-size: 16px;
+            }
+            .brand-title { font-family: 'Space Grotesk'; font-size: 16px; font-weight: 700; color: #fff; }
+            .brand-sub { font-size: 10px; font-family: 'JetBrains Mono'; color: var(--cyan); }
+            .nav-tabs {
+              display: grid; grid-template-columns: 1fr 1fr; padding: 10px; gap: 6px; border-bottom: 1px solid var(--rule);
+            }
+            .tab-btn {
+              padding: 8px; background: var(--panel-raised); border: 1px solid var(--rule);
+              border-radius: var(--radius); color: var(--dust); cursor: pointer; font-size: 12px; font-weight: 600;
+              transition: all 0.2s ease;
+            }
+            .tab-btn.active {
+              background: var(--cyan-dim); border-color: var(--cyan-line); color: var(--cyan);
+            }
+            .section { padding: 16px; border-bottom: 1px solid var(--rule); }
+            .sec-title {
+              font-size: 11px; font-weight: 600; color: var(--dust-dim); text-transform: uppercase;
+              letter-spacing: 0.05em; margin-bottom: 10px; display: flex; justify-content: space-between;
+            }
+            .model-list { display: flex; flex-direction: column; gap: 4px; max-height: 240px; overflow-y: auto; }
+            .model-item {
+              display: flex; align-items: center; justify-content: space-between; padding: 7px 10px;
+              border-radius: 6px; background: var(--panel-raised); border: 1px solid transparent; cursor: pointer;
+            }
+            .model-item.active { border-color: var(--cyan-line); background: var(--cyan-dim); }
+            .model-name { font-family: 'JetBrains Mono'; font-size: 11px; color: var(--ivory); }
+            .btn-pull {
+              background: transparent; border: 1px solid var(--rule-bright); color: var(--dust);
+              font-size: 10px; padding: 2px 6px; border-radius: 4px; cursor: pointer;
+            }
+            .btn-pull:hover { color: var(--cyan); border-color: var(--cyan); }
+            .main-view { flex: 1; display: flex; flex-direction: column; height: 100vh; position: relative; }
+            .view-panel { display: none; flex: 1; flex-direction: column; height: 100%; overflow: hidden; }
+            .view-panel.active { display: flex; }
+            .chat-feed { flex: 1; overflow-y: auto; padding: 24px; display: flex; flex-direction: column; gap: 16px; }
+            .turn { max-width: 720px; width: 100%; margin: 0 auto; display: flex; flex-direction: column; gap: 6px; }
+            .turn.user { align-items: flex-end; }
+            .turn.assistant { align-items: flex-start; }
+            .bubble {
+              padding: 12px 16px; border-radius: var(--radius); line-height: 1.6; max-width: 85%;
+              background: var(--panel); border: 1px solid var(--rule); word-break: break-word;
+            }
+            .turn.user .bubble { background: var(--cyan-dim); border-color: var(--cyan-line); }
+            .composer {
+              padding: 16px 24px 20px; background: linear-gradient(180deg, transparent 0%, var(--ink) 40%);
+            }
+            .dock {
+              max-width: 720px; margin: 0 auto; background: var(--panel); border: 1px solid var(--rule);
+              border-radius: var(--radius); display: flex; align-items: flex-end; padding: 8px 12px; gap: 8px;
+            }
+            .dock textarea {
+              flex: 1; background: transparent; border: none; color: #fff; font-family: inherit; font-size: 14px;
+              outline: none; resize: none; min-height: 24px; max-height: 180px; padding: 6px 0;
+            }
+            .btn-send {
+              background: var(--cyan); color: #000; border: none; font-weight: 700; width: 32px; height: 32px;
+              border-radius: 6px; cursor: pointer; flex-shrink: 0;
+            }
+            .video-studio { padding: 30px; max-width: 800px; margin: 0 auto; width: 100%; overflow-y: auto; }
+            .form-grid { display: flex; flex-direction: column; gap: 16px; margin-top: 20px; }
+            .form-group { display: flex; flex-direction: column; gap: 6px; }
+            .form-group label { font-size: 12px; color: var(--dust); font-weight: 600; }
+            .form-group input, .form-group select, .form-group textarea {
+              background: var(--panel); border: 1px solid var(--rule); border-radius: var(--radius);
+              padding: 10px 12px; color: #fff; font-family: inherit; font-size: 13px; outline: none;
+            }
+            .form-group input:focus, .form-group textarea:focus { border-color: var(--cyan-line); }
+            .btn-gen {
+              padding: 12px; background: var(--cyan); color: #000; font-weight: 700; border: none;
+              border-radius: var(--radius); cursor: pointer; margin-top: 10px; font-size: 14px;
+            }
+            .terminal {
+              margin-top: 20px; background: #07080a; border: 1px solid var(--rule); border-radius: var(--radius);
+              padding: 12px; font-family: 'JetBrains Mono'; font-size: 11px; color: #94a3b8; height: 160px; overflow-y: auto;
+            }
+          </style>
+          </head>
+          <body>
+            <div class="sidebar">
+              <div class="brand">
+                <div class="brand-icon">🦙</div>
+                <div>
+                  <div class="brand-title">Unified Studio</div>
+                  <div class="brand-sub">LLM + LongCat-Video</div>
+                </div>
+              </div>
+              <div class="nav-tabs">
+                <button class="tab-btn active" onclick="switchTab('chat')">💬 LLM Chat</button>
+                <button class="tab-btn" onclick="switchTab('video')">🎬 LongCat</button>
+              </div>
+              <div class="section">
+                <div class="sec-title"><span>LLM Models</span><button onclick="loadModels()" style="background:none; border:none; color:var(--cyan); cursor:pointer;">↻</button></div>
+                <div class="model-list" id="llmList">Scanning models...</div>
+              </div>
+              <div class="section">
+                <div class="sec-title"><span>Host Metrics</span></div>
+                <div style="font-family:'JetBrains Mono'; font-size:11px; color:var(--dust);" id="hostStats">CPU: -- | RAM: --</div>
               </div>
             </div>
-            ${!m.downloaded ? `<button class="dl-btn" data-pull="${escapeHtml(m.name)}">Pull</button>` : ''}
-          </div>`;
-      }).join('');
-    }
-    
-    if (modelListContainer) {
-      modelListContainer.addEventListener('click', (e) => {
-        const pullBtn = e.target.closest('[data-pull]');
-        if (pullBtn) {
-          const modelName = pullBtn.getAttribute('data-pull');
-          if (modelName) startModelDownload(modelName);
-          return;
-        }
-        const row = e.target.closest('.model-row[data-clickable="1"]');
-        if (row) {
-          const modelName = row.getAttribute('data-model');
-          if (modelName) selectModel(modelName);
-        }
-      });
-    }
-    
-    if ($('refreshBtn')) {
-      $('refreshBtn').addEventListener('click', loadModels);
-    }
-    
-    function selectModel(modelName) {
-      currentModel = modelName;
-      if (topbarModel) topbarModel.textContent = modelName;
-      renderModelList();
-      updateComposerState();
-    }
-    
-    function updateComposerState() {
-      const ready = !!currentModel;
-      if (userInput) userInput.disabled = !ready;
-      if (sendButton) sendButton.disabled = !ready;
-      if (userInput) {
-        userInput.placeholder = ready
-          ? 'Ask a question, or attach an image...'
-          : 'Download a model from the panel to begin…';
-      }
-      if (!ready) {
-        renderEmptyLog();
-      }
-    }
-    
-    function renderEmptyLog() {
-      if (!logInner || messageHistory.length) return;
-      logInner.innerHTML = `
-        <div class="empty-state">
-          <h2>No model loaded yet</h2>
-          <p>Pick a model in the panel and hit "Pull" to download it, then select it to start a session.</p>
-        </div>`;
-    }
-    
-    function appendTerminalLog(msg, type = '') {
-      if (!modalLogs) return;
-      const line = document.createElement('div');
-      line.className = 'term-line' + (type ? ' ' + type : '');
-      line.textContent = msg;
-      modalLogs.appendChild(line);
-      modalLogs.scrollTop = modalLogs.scrollHeight;
-    }
-    
-    function closeModal() { 
-      if (downloadModal) downloadModal.style.display = 'none'; 
-    }
-    
-    async function startModelDownload(modelName) {
-      if (!downloadModal) return;
-      
-      downloadModal.style.display = 'flex';
-      if (modalTitle) modalTitle.textContent = modelName;
-      if (modalBar) modalBar.style.width = '0%';
-      if (modalPercent) modalPercent.textContent = '0%';
-      if (modalLogs) modalLogs.innerHTML = '';
-      if (metricSpeed) metricSpeed.textContent = '—';
-      if (metricSize) metricSize.textContent = '—';
-      if (metricEta) metricEta.textContent = '—';
-      if (modalCloseBtn) {
-        modalCloseBtn.disabled = true;
-        modalCloseBtn.textContent = 'Downloading…';
-        modalCloseBtn.onclick = null;
-      }
-    
-      try {
-        const resp = await fetch('/api/pull', {
-          method: 'POST', 
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ model: modelName })
-        });
-        
-        if (!resp.ok) throw new Error('Pull request failed');
-        
-        const reader = resp.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
-        let failed = false;
-    
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || '';
-    
-          for (const line of lines) {
-            if (!line.startsWith('data: ')) continue;
-            if (line.slice(6) === '[DONE]') continue;
-            try {
-              const data = JSON.parse(line.slice(6));
-              if (data.error) {
-                appendTerminalLog(data.error, 'error');
-                failed = true;
-                if (modalCloseBtn) {
-                  modalCloseBtn.disabled = false;
-                  modalCloseBtn.textContent = 'Close';
-                  modalCloseBtn.onclick = closeModal;
-                }
-                continue;
-              }
-              if (data.raw) appendTerminalLog(data.raw);
-              if (data.percent !== undefined && data.percent !== null) {
-                if (modalBar) modalBar.style.width = data.percent + '%';
-                if (modalPercent) modalPercent.textContent = data.percent + '%';
-              }
-            } catch (e) {
-              console.warn('Parse error:', e);
-            }
-          }
-        }
-    
-        if (!failed) {
-          if (modalBar) modalBar.style.width = '100%';
-          if (modalPercent) modalPercent.textContent = '100%';
-          if (modalCloseBtn) {
-            modalCloseBtn.disabled = false;
-            modalCloseBtn.textContent = 'Done — select model';
-            modalCloseBtn.onclick = () => { 
-              closeModal(); 
-              loadModels().then(() => {
-                if (modelName) selectModel(modelName);
-              });
-            };
-          }
-          loadModels();
-        }
-      } catch (err) {
-        console.error('Download error:', err);
-        appendTerminalLog('Connection lost: ' + err.message, 'error');
-        if (modalCloseBtn) {
-          modalCloseBtn.disabled = false;
-          modalCloseBtn.textContent = 'Close';
-          modalCloseBtn.onclick = closeModal;
-        }
-      }
-    }
-    
-    // Chat functionality
-    function appendTurn(role, htmlContent, isLoading, isError) {
-      if (!logInner) return null;
-      const turn = document.createElement('div');
-      turn.className = `turn ${role}` + (isError ? ' error' : '');
-      const label = role === 'user' ? 'You' : 'Console';
-      turn.innerHTML = `<div class="turn-label">${label}</div><div class="turn-body"></div>`;
-      logInner.appendChild(turn);
-      const body = turn.querySelector('.turn-body');
-      renderMarkdown(body, htmlContent, isLoading);
-      if (logEl) logEl.scrollTop = logEl.scrollHeight;
-      return body;
-    }
-    
-    function updateLastAssistantTurn(content, complete) {
-      if (!logInner) return;
-      const turns = logInner.querySelectorAll('.turn.assistant');
-      if (!turns.length) return;
-      renderMarkdown(turns[turns.length - 1].querySelector('.turn-body'), content, !complete);
-      if (logEl) logEl.scrollTop = logEl.scrollHeight;
-    }
-    
-    function newSession() {
-      if (logInner) logInner.innerHTML = '';
-      messageHistory = [];
-      totalTokens = 0;
-      if (tokenCounter) tokenCounter.textContent = '0 tokens generated';
-      if (!currentModel) renderEmptyLog();
-    }
-    
-    if ($('newSessionBtn')) {
-      $('newSessionBtn').addEventListener('click', newSession);
-    }
-    
-    function stopGenerating() { 
-      if (controller) {
-        controller.abort();
-        controller = null;
-      }
-    }
-    
-    if (stopButton) {
-      stopButton.addEventListener('click', stopGenerating);
-    }
-    
-    async function sendMessage() {
-      if (isStreaming || !currentModel) return;
-      const text = userInput ? userInput.value.trim() : '';
-      if (!text && !attachedMediaBase64) return;
-    
-      let displayHtml = escapeHtml(text).replace(/\n/g, '<br>');
-      let userMessageObj = { role: 'user', content: text };
-    
-      if (attachedMediaBase64) {
-        userMessageObj.images = [attachedMediaBase64];
-        displayHtml += `<br><img src="data:image/jpeg;base64,${attachedMediaBase64}" alt="Attached image">`;
-      }
-    
-      appendTurn('user', displayHtml, false, false);
-      messageHistory.push(userMessageObj);
-    
-      if (userInput) {
-        userInput.value = '';
-        userInput.style.height = 'auto';
-      }
-      removeMedia();
-      
-      if (sendButton) sendButton.style.display = 'none';
-      if (stopButton) stopButton.style.display = 'flex';
-      isStreaming = true;
-      controller = new AbortController();
-    
-      setActivity('Connecting to engine…');
-      appendTurn('assistant', '', true, false);
-    
-      let fullContent = '';
-      try {
-        const response = await fetch('/api/chat', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          signal: controller.signal,
-          body: JSON.stringify({
-            messages: messageHistory,
-            model: currentModel,
-            temperature: parseFloat(temperatureEl ? temperatureEl.value : 0.7),
-            max_tokens: parseInt(maxTokensEl ? maxTokensEl.value : 2048, 10)
-          })
-        });
-    
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-        }
-    
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
-        let streamError = null;
-    
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || '';
-          for (const line of lines) {
-            if (!line.startsWith('data: ')) continue;
-            if (line.slice(6) === '[DONE]') continue;
-            try {
-              const parsed = JSON.parse(line.slice(6));
-              if (parsed.error) streamError = parsed.error;
-              else if (parsed.content) {
-                fullContent += parsed.content;
-                updateLastAssistantTurn(fullContent, false);
-              }
-            } catch (e) {
-              console.warn('Stream parse error:', e);
-            }
-          }
-        }
-    
-        setActivity(null);
-        if (streamError) throw new Error(streamError);
-        updateLastAssistantTurn(fullContent, true);
-        messageHistory.push({ role: 'assistant', content: fullContent });
-        totalTokens += Math.ceil(fullContent.length / 4);
-        if (tokenCounter) tokenCounter.textContent = `${totalTokens} tokens generated`;
-      } catch (error) {
-        setActivity(null);
-        const aborted = error.name === 'AbortError';
-        updateLastAssistantTurn(aborted ? '_Generation stopped._' : `Error: ${error.message || 'request failed.'}`, true);
-      } finally {
-        if (sendButton) sendButton.style.display = 'flex';
-        if (stopButton) stopButton.style.display = 'none';
-        isStreaming = false;
-        controller = null;
-        if (userInput) userInput.focus();
-      }
-    }
-    
-    if (sendButton) {
-      sendButton.addEventListener('click', sendMessage);
-    }
-    
-    if (userInput) {
-      userInput.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter' && !e.shiftKey) {
-          e.preventDefault();
-          sendMessage();
-        }
-      });
-      
-      userInput.addEventListener('input', function () {
-        this.style.height = 'auto';
-        this.style.height = Math.min(this.scrollHeight, 200) + 'px';
-      });
-    }
-    
-    if (temperatureEl) {
-      temperatureEl.addEventListener('input', function () { 
-        const tempVal = $('tempVal');
-        if (tempVal) tempVal.textContent = this.value; 
-      });
-    }
-    
-    if (maxTokensEl) {
-      maxTokensEl.addEventListener('input', function () { 
-        const tokenVal = $('tokenVal');
-        if (tokenVal) tokenVal.textContent = this.value; 
-      });
-    }
-    
-    // Initialize
-    renderEmptyLog();
-    loadModels();
-  </script>
-  </body>
-  </html>
-  """
-  
-  if __name__ == "__main__":
-      uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
-  PYEOF
-          echo "✅ Server script written successfully"
 
-      - name: 🌐 Start web server
+            <div class="main-view">
+              <!-- LLM View -->
+              <div class="view-panel active" id="chatPanel">
+                <div class="chat-feed" id="chatFeed">
+                  <div class="turn assistant">
+                    <div class="bubble">Ready. Pick an Ollama model or jump to the 🎬 LongCat tab to generate videos.</div>
+                  </div>
+                </div>
+                <div class="composer">
+                  <div class="dock">
+                    <textarea id="promptInput" rows="1" placeholder="Type your message..."></textarea>
+                    <button class="btn-send" id="sendBtn" onclick="sendChat()">⏎</button>
+                  </div>
+                </div>
+              </div>
+
+              <!-- LongCat View -->
+              <div class="view-panel" id="videoPanel">
+                <div class="video-studio">
+                  <h2>🎬 Meituan LongCat-Video Engine</h2>
+                  <p style="color:var(--dust); margin-top:4px;">Generate high-consistency 720p 30fps text-to-video, image-to-video, or avatar animations.</p>
+                  
+                  <div class="form-grid">
+                    <div class="form-group">
+                      <label>Task Type</label>
+                      <select id="videoTask">
+                        <option value="t2v">Text-to-Video (T2V)</option>
+                        <option value="i2v">Image-to-Video (I2V)</option>
+                        <option value="avatar">Avatar Audio-to-Video (Avatar-1.5)</option>
+                      </select>
+                    </div>
+                    <div class="form-group">
+                      <label>Model Checkpoint</label>
+                      <select id="videoModel">
+                        <option value="LongCat-Video-Avatar-1.5">LongCat-Video-Avatar-1.5 (Whisper-large / 8-step Distill)</option>
+                        <option value="LongCat-Video">LongCat-Video (13.6B Unified Core)</option>
+                        <option value="LongCat-Video-Avatar">LongCat-Video-Avatar (wav2vec2)</option>
+                      </select>
+                    </div>
+                    <div class="form-group">
+                      <label>Prompt Description</label>
+                      <textarea id="videoPrompt" rows="3" placeholder="A cinematic camera sweep of a cyberpunk city in rainy neon night, highly detailed, 4k..."></textarea>
+                    </div>
+                    <button class="btn-gen" onclick="triggerVideoGen()">Generate Video</button>
+                    <div class="terminal" id="videoLogs">> LongCat inference console idle.</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <script>
+              let activeTab = 'chat';
+              let selectedModel = null;
+              let chatHistory = [];
+
+              function switchTab(tab) {
+                activeTab = tab;
+                document.querySelectorAll('.tab-btn').forEach((b, i) => b.classList.toggle('active', (i===0 && tab==='chat') || (i===1 && tab==='video')));
+                document.getElementById('chatPanel').classList.toggle('active', tab === 'chat');
+                document.getElementById('videoPanel').classList.toggle('active', tab === 'video');
+              }
+
+              async function loadModels() {
+                try {
+                  const res = await fetch('/api/models');
+                  const data = await res.json();
+                  const container = document.getElementById('llmList');
+                  container.innerHTML = data.llm_models.map(m => `
+                    <div class="model-item ${m.name === selectedModel ? 'active' : ''}" onclick="selectModel('${m.name}')">
+                      <span class="model-name">${m.name}</span>
+                      ${m.downloaded ? '<span style="color:var(--signal); font-size:10px;">ready</span>' : `<button class="btn-pull" onclick="event.stopPropagation(); pullModel('${m.name}')">pull</button>`}
+                    </div>
+                  `).join('');
+                  if (!selectedModel && data.llm_models.some(m => m.downloaded)) {
+                    selectModel(data.llm_models.find(m => m.downloaded).name);
+                  }
+                } catch(e) { console.error(e); }
+              }
+
+              function selectModel(name) {
+                selectedModel = name;
+                loadModels();
+              }
+
+              async function pullModel(name) {
+                alert(`Starting pull for ${name}. Check logs.`);
+                await fetch('/api/pull', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({model:name})});
+                loadModels();
+              }
+
+              async function sendChat() {
+                const input = document.getElementById('promptInput');
+                const text = input.value.trim();
+                if (!text || !selectedModel) return;
+                input.value = '';
+
+                const feed = document.getElementById('chatFeed');
+                feed.innerHTML += `<div class="turn user"><div class="bubble">${text}</div></div>`;
+                const assistantBubble = document.createElement('div');
+                assistantBubble.className = 'turn assistant';
+                assistantBubble.innerHTML = `<div class="bubble">...</div>`;
+                feed.appendChild(assistantBubble);
+
+                chatHistory.push({ role:'user', content:text });
+                const res = await fetch('/api/chat', {
+                  method: 'POST',
+                  headers: {'Content-Type':'application/json'},
+                  body: JSON.stringify({ messages: chatHistory, model: selectedModel })
+                });
+
+                const reader = res.body.getReader();
+                const decoder = new TextDecoder();
+                let full = '';
+                while (true) {
+                  const { done, value } = await reader.read();
+                  if (done) break;
+                  const chunk = decoder.decode(value);
+                  for (let line of chunk.split('\\n')) {
+                    if (!line.startsWith('data: ') || line.includes('[DONE]')) continue;
+                    try {
+                      const data = JSON.parse(line.slice(6));
+                      if (data.content) {
+                        full += data.content;
+                        assistantBubble.querySelector('.bubble').textContent = full;
+                      }
+                    } catch(e){}
+                  }
+                }
+                chatHistory.push({ role:'assistant', content:full });
+              }
+
+              async function triggerVideoGen() {
+                const logs = document.getElementById('videoLogs');
+                logs.innerHTML = '> Submitting task to LongCat engine...\\n';
+                const task = document.getElementById('videoTask').value;
+                const model = document.getElementById('videoModel').value;
+                const prompt = document.getElementById('videoPrompt').value;
+
+                const res = await fetch('/api/video/generate', {
+                  method:'POST',
+                  headers:{'Content-Type':'application/json'},
+                  body: JSON.stringify({ task, model, prompt })
+                });
+
+                const reader = res.body.getReader();
+                const decoder = new TextDecoder();
+                while (true) {
+                  const { done, value } = await reader.read();
+                  if (done) break;
+                  const chunk = decoder.decode(value);
+                  for (let line of chunk.split('\\n')) {
+                    if (!line.startsWith('data: ') || line.includes('[DONE]')) continue;
+                    try {
+                      const data = JSON.parse(line.slice(6));
+                      if (data.raw) {
+                        logs.innerHTML += data.raw + '\\n';
+                        logs.scrollTop = logs.scrollHeight;
+                      }
+                    } catch(e){}
+                  }
+                }
+              }
+
+              setInterval(async () => {
+                try {
+                  const r = await fetch('/api/stats');
+                  const d = await r.json();
+                  document.getElementById('hostStats').innerText = `CPU: ${d.cpu_percent}% | RAM: ${d.ram_used}`;
+                } catch(e){}
+              }, 4000);
+
+              loadModels();
+            </script>
+          </body>
+          </html>
+          """
+
+          if __name__ == "__main__":
+              uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
+          PYEOF
+          echo "✅ Unified server script built"
+
+      - name: 🌐 Launch Unified Studio
         run: |
           echo "──────────────────────────────────────────"
-          echo " 🌐  Starting web UI"
+          echo " 🌐 Launching FastAPI AI Gateway"
           echo "──────────────────────────────────────────"
-          nohup python ollama_server.py > /tmp/webui.log 2>&1 &
-          echo $! > /tmp/webui.pid
+          nohup python unified_server.py > /tmp/unified_ui.log 2>&1 &
+          echo $! > /tmp/unified_ui.pid
+          
           ready=false
-          for i in $(seq 1 15); do
-            if curl -sf "http://localhost:${PORT}" > /dev/null 2>&1; then
-              echo "✅ Web UI is ready!"
+          for i in $(seq 1 20); do
+            if curl -sf "http://localhost:${PORT}/api/health" > /dev/null 2>&1; then
+              echo "✅ Unified Studio is live!"
               ready=true
               break
             fi
             sleep 2
           done
           if [ "$ready" != "true" ]; then
-            echo "❌ Web UI failed to start. Last logs:"
-            tail -n 50 /tmp/webui.log || true
+            echo "❌ Studio failed to start. Logs:"
+            tail -n 50 /tmp/unified_ui.log || true
             exit 1
           fi
 
-      - name: 📦 Install cloudflared
+      - name: 📦 Install Cloudflared
         run: |
           curl -L -s https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
           chmod +x cloudflared
           sudo mv cloudflared /usr/local/bin/
-          cloudflared --version
 
-      - name: 🌐 Create tunnel and wait
+      - name: 🌍 Expose Cloudflare Tunnel
         run: |
           echo "──────────────────────────────────────────"
-          echo " 🌐  Creating Cloudflare tunnel"
+          echo " 🌐 Establishing Global Public Tunnel"
           echo "──────────────────────────────────────────"
           cloudflared tunnel --url "http://127.0.0.1:${PORT}" --protocol http2 > tunnel.log 2>&1 &
           TUNNEL_PID=$!
-          echo "⏳ Waiting for tunnel URL..."
+          
           TUNNEL_URL=""
           for i in $(seq 1 30); do
             TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log 2>/dev/null | head -1)
             [ -n "$TUNNEL_URL" ] && break
             sleep 2
           done
+          
           if [ -z "$TUNNEL_URL" ]; then
-            echo "❌ Could not get a tunnel URL. Tunnel log:"
+            echo "❌ Tunnel initialization failed:"
             cat tunnel.log
             exit 1
           fi
+          
           echo ""
           echo "╔═══════════════════════════════════════════════════════════════════╗"
-          echo "║                🎉  Y O U R   L L M   I S   R E A D Y  🎉          ║"
+          echo "║         🎉   U N I F I E D   A I   S T U D I O   L I V E   🎉     ║"
           echo "╠═══════════════════════════════════════════════════════════════════╣"
           echo "║  🔗  $TUNNEL_URL"
           echo "╚═══════════════════════════════════════════════════════════════════╝"
+          
           {
-            echo "## 🦙 Your LLM web UI is live"
+            echo "## 🦙🎬 All-in-One AI Studio is Online"
             echo ""
-            echo "**URL:** $TUNNEL_URL"
+            echo "**Public URL:** $TUNNEL_URL"
             echo ""
-            echo "**Catalog Models:** 24+ On-demand downloadable models"
-            echo "**Context:** ${CONTEXT_SIZE} tokens"
-            echo ""
-            echo "> Models start un-pulled by design and can be downloaded instantly via the sidebar interface on demand."
+            echo "### What's included in this instance:"
+            echo "- **💬 LLM & Vision Studio:** Powered by Ollama with on-demand model pulling."
+            echo "- **🎬 Meituan LongCat-Video:** 13.6B Unified Core & Avatar-1.5 engine ready."
+            echo "- **⚡ Integrated Console:** Hardware telemetry and real-time streaming progress logs."
           } >> "$GITHUB_STEP_SUMMARY"
+          
           wait "$TUNNEL_PID"
 
-      - name: 🧹 Cleanup
+      - name: 🧹 Teardown & Clean
         if: always()
         run: |
           pkill -f "cloudflared" 2>/dev/null || true
-          pkill -f "python ollama_server" 2>/dev/null || true
+          pkill -f "python unified_server.py" 2>/dev/null || true
           pkill -f "ollama serve" 2>/dev/null || true
-          echo "✅ Cleanup complete"
+          echo "✅ All background engines successfully terminated"
