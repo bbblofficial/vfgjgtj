@@ -100,6 +100,10 @@ jobs:
           CONTEXT_SIZE = int(os.getenv("CONTEXT_SIZE", "4096"))
           PORT = int(os.getenv("PORT", "7860"))
           
+          # Directory for external model downloads (writable)
+          MODELS_DIR = os.path.join(os.getcwd(), "models")
+          os.makedirs(MODELS_DIR, exist_ok=True)
+          
           SYSTEM_PROMPT = """You are a highly capable, expert AI assistant. Your primary goal is to be exceptionally helpful, accurate, and clear. 
           Follow these guidelines:
           - Provide direct, concise answers without unnecessary filler.
@@ -292,9 +296,10 @@ jobs:
                       except Exception as inner_exc:
                           logger.warning(f"Could not reach Ollama for tags: {inner_exc}")
                   
+                  # Check external model directories
                   for item in CATALOG_MODELS:
                       if item.get("type") == "image":
-                          model_path = f"/models/{item['name'].replace(' ', '_')}"
+                          model_path = os.path.join(MODELS_DIR, item["name"].replace(' ', '_'))
                           if os.path.exists(model_path) and os.path.isdir(model_path):
                               pulled_names.add(item["name"])
                   
@@ -358,7 +363,7 @@ jobs:
                   return StreamingResponse(error_gen(), media_type="text/event-stream")
               
               repo_id = repo_info.get("repo")
-              target_dir = f"/models/{model_name.replace(' ', '_')}"
+              target_dir = os.path.join(MODELS_DIR, model_name.replace(' ', '_'))
               
               async def generate_pull():
                   try:
@@ -402,7 +407,6 @@ jobs:
           async def chat(request: ChatRequest):
               if request.model in EXTERNAL_MODEL_MAP:
                   async def error_gen():
-                      # Fixed: use a separate error message variable to avoid backslash escaping in f-string
                       error_msg = f'Model "{request.model}" is an image generator, not a chat LLM.'
                       yield f"data: {json.dumps({'error': error_msg})}\n\n"
                       yield "data: [DONE]\n\n"
