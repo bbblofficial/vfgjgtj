@@ -12,6 +12,10 @@ on:
         required: false
         default: '4096'
         type: string
+      hf_token:
+        description: '🔑 Hugging Face Token (Required for gated models like FLUX)'
+        required: false
+        type: string
 permissions:
   contents: read
 concurrency:
@@ -24,6 +28,7 @@ jobs:
     env:
       CONTEXT_SIZE: ${{ inputs.context_size }}
       PORT: ${{ inputs.port }}
+      HF_TOKEN: ${{ inputs.hf_token || secrets.HF_TOKEN }}
     steps:
       - name: 🦙 Show banner
         run: |
@@ -51,7 +56,7 @@ jobs:
           pip install --no-cache-dir \
             fastapi uvicorn aiohttp httpx python-multipart \
             jinja2 websockets pydantic psutil \
-            huggingface-hub
+            "huggingface_hub[cli]"
           ollama --version
           python --version
       - name: 🚀 Start Ollama server
@@ -99,6 +104,7 @@ jobs:
           OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
           CONTEXT_SIZE = int(os.getenv("CONTEXT_SIZE", "4096"))
           PORT = int(os.getenv("PORT", "7860"))
+          HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
           
           # Directory for external model downloads (writable)
           MODELS_DIR = os.path.join(os.getcwd(), "models")
@@ -368,8 +374,12 @@ jobs:
               async def generate_pull():
                   try:
                       os.makedirs(target_dir, exist_ok=True)
-                      # Use the new 'hf' CLI instead of deprecated 'huggingface-cli'
-                      cmd = ["hf", "download", repo_id, "--local-dir", target_dir]
+                      
+                      # Fixed: Use huggingface-cli and pass HF_TOKEN to authenticate
+                      cmd = ["huggingface-cli", "download", repo_id, "--local-dir", target_dir]
+                      if HF_TOKEN:
+                          cmd.extend(["--token", HF_TOKEN])
+
                       process = subprocess.Popen(
                           cmd,
                           stdout=subprocess.PIPE,
@@ -1546,7 +1556,7 @@ jobs:
             echo "**Context:** ${CONTEXT_SIZE} tokens"
             echo "**Markdown:** Full GFM + footnotes, definition lists, abbreviations, emoji, HTML, and KaTeX math"
             echo ""
-            echo "> Image models are listed as `image` type. They cannot be used for chat, but you can download them via the UI."
+            echo "> Image models are listed as \`image\` type. They cannot be used for chat, but you can download them via the UI."
           } >> "$GITHUB_STEP_SUMMARY"
           wait "$TUNNEL_PID"
       - name: 🧹 Cleanup
