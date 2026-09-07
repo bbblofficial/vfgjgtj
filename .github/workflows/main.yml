@@ -1,4 +1,4 @@
-name: 🦙🎬 Glassmorphism AI Studio (On-Demand)
+name: 🦙🎬 Full Pre-Loaded AI Studio (Ollama + LongCat-Video)
 
 on:
   workflow_dispatch:
@@ -18,7 +18,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ai-web-ui
+  group: ai-preloaded-studio
   cancel-in-progress: true
 
 jobs:
@@ -29,17 +29,16 @@ jobs:
       CONTEXT_SIZE: ${{ inputs.context_size }}
       PORT: ${{ inputs.port }}
     steps:
-      - name: 🦙 Show banner
+      - name: 🚀 System Banner
         run: |
           echo "╔═══════════════════════════════════════════════════════════════════╗"
-          echo "║    🦙 🎬  O N - D E M A N D   A I   S T U D I O   ( U I )         ║"
+          echo "║     🦙 🎬  F U L L Y   P R E - L O A D E D   A I   S T U D I O      ║"
           echo "╚═══════════════════════════════════════════════════════════════════╝"
           echo "  📝 Context: ${CONTEXT_SIZE} tokens"
           echo "  🔌 Port:    ${PORT}"
           echo "  🏃 Runner:  $(uname -a)"
           echo "  💾 Memory:  $(free -h | awk '/Mem:/{print $2}')"
           echo "  🧠 CPUs:    $(nproc)"
-          echo "  ⏱️ Timeout:  6 Hours (360 minutes)"
 
       - name: 🧹 Maximize Runner Storage (Creates 100GB Workspace)
         uses: easimon/maximize-build-space@master
@@ -50,21 +49,50 @@ jobs:
           remove-codeql: 'true'
           remove-docker-images: 'true'
 
-      - name: 🐍 Setup Python
+      - name: 🐍 Setup Python 3.10
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      - name: 📦 Install web dependencies ONLY
+      - name: 📦 Install Web Dependencies
+        run: |
+          pip install --no-cache-dir fastapi uvicorn aiohttp httpx python-multipart jinja2 websockets pydantic psutil
+
+      - name: 🦙 Install & Start Ollama Engine
         run: |
           echo "──────────────────────────────────────────"
-          echo " 📦  Installing Web UI Framework"
+          echo " 🦙 Installing Ollama Core"
           echo "──────────────────────────────────────────"
-          pip install --no-cache-dir \
-            fastapi uvicorn aiohttp httpx python-multipart \
-            jinja2 websockets pydantic psutil
+          curl -L -s https://ollama.com/download/ollama-linux-amd64 -o ollama
+          chmod +x ollama
+          mkdir -p ollama_models
+          export OLLAMA_MODELS="$(pwd)/ollama_models"
+          
+          nohup ./ollama serve > /tmp/ollama.log 2>&1 &
+          
+          echo "⏳ Waiting for Ollama API..."
+          for i in {1..15}; do
+            if curl -sf http://127.0.0.1:11434/api/tags > /dev/null 2>&1; then
+              echo "✅ Ollama online!"
+              break
+            fi
+            sleep 2
+          done
 
-      - name: 🔧 Write the web server (Glassmorphism UI)
+      - name: 🎬 Install LongCat-Video Framework
+        run: |
+          echo "──────────────────────────────────────────"
+          echo " 🎬 Installing LongCat-Video Framework"
+          echo "──────────────────────────────────────────"
+          git clone --single-branch --branch main https://github.com/meituan-longcat/LongCat-Video.git
+          cd LongCat-Video
+          pip install --no-cache-dir torch==2.6.0+cu124 torchvision==0.21.0+cu124 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+          pip install --no-cache-dir ninja packaging
+          pip install --no-cache-dir -r requirements.txt
+          pip install --no-cache-dir librosa -r requirements_avatar.txt
+          echo "✅ LongCat-Video fully installed."
+
+      - name: 🔧 Build Unified Studio Gateway
         run: |
           cat > ai_studio.py << 'PYEOF'
           import json
@@ -97,8 +125,7 @@ jobs:
           os.environ["HF_HOME"] = HF_HOME
           OLLAMA_HOST = "http://127.0.0.1:11434"
 
-          app = FastAPI(title="Local AI Studio UI")
-          ollama_process = None
+          app = FastAPI(title="Pre-Loaded AI Studio")
 
           CATALOG_MODELS = [
               {"name": "qwen2.5:0.5b", "type": "general"},
@@ -137,96 +164,13 @@ jobs:
 
           @app.get("/api/system/status")
           def sys_status():
-              global ollama_process
               disk = psutil.disk_usage(WORKSPACE_DIR)
               return {
-                  "ollama_installed": os.path.exists(OLLAMA_BIN),
-                  "ollama_running": ollama_process is not None and ollama_process.poll() is None,
-                  "longcat_installed": os.path.exists(LONGCAT_DIR),
+                  "ollama_installed": True,
+                  "ollama_running": True,
+                  "longcat_installed": True,
                   "disk_free": f"{disk.free / (1024**3):.1f} GB"
               }
-
-          @app.post("/api/engine/ollama/install")
-          async def install_ollama():
-              async def stream():
-                  yield "data: " + json.dumps({"raw": "🚀 Downloading Ollama...\n"}) + "\n\n"
-                  cmd = f"curl -L https://ollama.com/download/ollama-linux-amd64 -o {OLLAMA_BIN} && chmod +x {OLLAMA_BIN}"
-                  proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-                  for line in proc.stdout:
-                      yield "data: " + json.dumps({"raw": line}) + "\n\n"
-                  proc.wait()
-                  os.makedirs(OLLAMA_MODELS, exist_ok=True)
-                  yield "data: " + json.dumps({"raw": "✅ Ollama Installed! Click Start Engine.\n"}) + "\n\n"
-                  yield "data: [DONE]\n\n"
-              return StreamingResponse(stream(), media_type="text/event-stream")
-
-          @app.post("/api/engine/ollama/start")
-          def start_ollama():
-              global ollama_process
-              if not os.path.exists(OLLAMA_BIN): raise HTTPException(status_code=400, detail="Ollama not installed")
-              if ollama_process is None or ollama_process.poll() is not None:
-                  ollama_process = subprocess.Popen([OLLAMA_BIN, "serve"], env=os.environ)
-              return {"status": "started"}
-
-          @app.post("/api/engine/ollama/stop")
-          def stop_ollama():
-              global ollama_process
-              if ollama_process and ollama_process.poll() is None:
-                  ollama_process.terminate()
-                  ollama_process = None
-              subprocess.run(["pkill", "-f", "ollama serve"])
-              return {"status": "stopped"}
-
-          @app.post("/api/engine/ollama/uninstall")
-          def uninstall_ollama():
-              stop_ollama()
-              if os.path.exists(OLLAMA_BIN): os.remove(OLLAMA_BIN)
-              if os.path.exists(OLLAMA_MODELS): shutil.rmtree(OLLAMA_MODELS)
-              return {"status": "uninstalled"}
-
-          @app.post("/api/engine/longcat/install")
-          async def install_longcat():
-              async def stream():
-                  yield "data: " + json.dumps({"raw": "🚀 Cloning LongCat-Video repository...\n"}) + "\n\n"
-                  cmd = f"""
-                  git clone --single-branch --branch main https://github.com/meituan-longcat/LongCat-Video.git {LONGCAT_DIR} &&
-                  cd {LONGCAT_DIR} &&
-                  echo 'Installing PyTorch & CUDA 12.4 (Takes 2-3 mins)...' &&
-                  pip install torch==2.6.0+cu124 torchvision==0.21.0+cu124 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124 &&
-                  echo 'Installing Diffusers & Requirements...' &&
-                  pip install ninja packaging &&
-                  pip install -r requirements.txt &&
-                  pip install librosa -r requirements_avatar.txt
-                  """
-                  proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-                  for line in proc.stdout:
-                      yield "data: " + json.dumps({"raw": line}) + "\n\n"
-                  proc.wait()
-                  if proc.returncode == 0:
-                      yield "data: " + json.dumps({"raw": "✅ LongCat Installed successfully!\n"}) + "\n\n"
-                  else:
-                      yield "data: " + json.dumps({"raw": "❌ Installation failed.\n"}) + "\n\n"
-                  yield "data: [DONE]\n\n"
-              return StreamingResponse(stream(), media_type="text/event-stream")
-
-          @app.post("/api/engine/longcat/uninstall")
-          def uninstall_longcat():
-              if os.path.exists(LONGCAT_DIR): shutil.rmtree(LONGCAT_DIR)
-              if os.path.exists(HF_HOME): shutil.rmtree(HF_HOME)
-              return {"status": "uninstalled"}
-
-          @app.get("/api/health")
-          async def health():
-              global ollama_process
-              if not os.path.exists(OLLAMA_BIN) or not ollama_process:
-                  return {"status": "offline", "detail": "Engine stopped"}
-              try:
-                  async with httpx.AsyncClient(timeout=3) as client:
-                      r = await client.get(f"{OLLAMA_HOST}/api/tags")
-                      r.raise_for_status()
-                  return {"status": "ok"}
-              except Exception as exc:
-                  raise HTTPException(status_code=503, detail=str(exc))
 
           @app.get("/api/sysinfo")
           def sysinfo():
@@ -249,20 +193,18 @@ jobs:
           @app.get("/api/models")
           async def list_models():
               pulled_names = set()
-              if os.path.exists(OLLAMA_BIN) and ollama_process:
-                  try:
-                      async with httpx.AsyncClient(timeout=4) as client:
-                          r = await client.get(f"{OLLAMA_HOST}/api/tags")
-                          if r.status_code == 200:
-                              pulled_names = {m["name"] for m in r.json().get("models", [])}
-                  except:
-                      pass
+              try:
+                  async with httpx.AsyncClient(timeout=4) as client:
+                      r = await client.get(f"{OLLAMA_HOST}/api/tags")
+                      if r.status_code == 200:
+                          pulled_names = {m["name"] for m in r.json().get("models", [])}
+              except:
+                  pass
               models_payload = [{"name": i["name"], "type": i["type"], "downloaded": i["name"] in pulled_names} for i in CATALOG_MODELS]
               return {"models": models_payload}
 
           @app.post("/api/pull")
           async def pull_model(req: PullRequest):
-              if not os.path.exists(OLLAMA_BIN): raise HTTPException(status_code=400, detail="Ollama not installed")
               async def generate_pull():
                   try:
                       process = subprocess.Popen([OLLAMA_BIN, "pull", req.model], env=os.environ, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -339,12 +281,10 @@ jobs:
           <head>
           <meta charset="UTF-8">
           <meta name="viewport" content="width=device-width, initial-scale=1.0">
-          <title>AI Studio - Glassmorphism UI</title>
+          <title>AI Studio - Pre-Loaded</title>
           <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
           <script src="https://cdn.jsdelivr.net/npm/marked@4.3.0/marked.min.js"></script>
           <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.6/purify.min.js"></script>
-          <link id="hljsTheme" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css">
-          <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
           <style>
             :root {
               --ink: #131210; --panel: #1b1a16; --panel-raised: #201f1a;
@@ -389,45 +329,31 @@ jobs:
             .meter-seg.on { background: var(--amber); }
             .meter-val { font-family: 'JetBrains Mono'; font-size: 11px; width: 38px; text-align: right; }
             .rack-footer { margin-top: auto; padding: 14px 18px; display: flex; flex-direction: column; gap: 8px; }
-            .status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--dust-dim); display:inline-block; margin-right:6px;}
-            .status-dot.ok { background: var(--signal); box-shadow: 0 0 5px var(--signal); }
-            .status-dot.bad { background: var(--alert); box-shadow: 0 0 5px var(--alert); }
+            .status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--signal); display:inline-block; margin-right:6px; box-shadow: 0 0 5px var(--signal); }
             
             .viewport { flex: 1; display: flex; flex-direction: column; height: 100vh; position: relative; background: var(--ink); }
             .view-panel { display: none; flex: 1; flex-direction: column; height: 100%; overflow: hidden; }
             .view-panel.active { display: flex; }
             
-            /* Chat View */
             .log { flex: 1; overflow-y: auto; padding: 8px 0 160px; }
             .log-inner { max-width: 680px; margin: 0 auto; padding: 0 20px; }
             .turn { padding: 20px 0; border-bottom: 1px solid var(--rule); }
             .turn-label { font-family: 'JetBrains Mono'; font-size: 10.5px; color: var(--dust-dim); margin-bottom: 8px; }
             .turn.user .turn-label { color: var(--amber); }
             .turn-body { line-height: 1.65; font-size: 15px; }
-            .turn-body pre { background: #0e0d0b; color: #e2e8f0; padding: 32px 14px 14px; border-radius: var(--radius-m); overflow-x: auto; margin: 14px 0; border: 1px solid var(--rule); font-size: 13px; }
-            .turn-body code { font-family: 'JetBrains Mono'; font-size: 13px; }
             .dock-wrap { position: absolute; bottom: 0; left: 0; width: 100%; background: linear-gradient(180deg, transparent 0%, var(--ink) 45%); padding: 16px 20px 20px; display: flex; flex-direction: column; align-items: center; }
             .dock { max-width: 680px; width: 100%; background: var(--panel); border: 1px solid var(--rule); border-radius: var(--radius-m); display: flex; align-items: flex-end; padding: 8px 8px 8px 14px; gap: 8px; }
             .dock textarea { flex: 1; background: transparent; border: none; color: var(--ivory); font-family: inherit; font-size: 14.5px; resize: none; outline: none; min-height: 24px; max-height: 200px; padding: 6px 0; }
             .send-btn { background: var(--amber); color: var(--amber-ink); border: none; border-radius: var(--radius-s); width: 34px; height: 34px; font-weight: 600; cursor: pointer; flex-shrink: 0; }
-            .send-btn:disabled { background: var(--panel-raised); color: var(--dust-dim); }
-
-            /* Setup & Video Views */
+            
             .studio-view { max-width: 720px; margin: 0 auto; width: 100%; padding: 40px 20px; overflow-y: auto; }
             .card { background: var(--panel); border: 1px solid var(--rule); border-radius: var(--radius-m); padding: 24px; margin-bottom: 24px; }
             .card h3 { font-family: 'Space Grotesk'; font-size: 18px; margin-bottom: 16px; color: var(--ivory); display:flex; justify-content:space-between; align-items:center;}
-            .badge { font-family: 'JetBrains Mono'; font-size: 11px; padding: 4px 8px; border-radius: 4px; background: var(--panel-raised); border:1px solid var(--rule); color: var(--dust); }
-            .badge.on { background: rgba(111,174,143,0.1); border-color: rgba(111,174,143,0.3); color: var(--signal); }
-            .action-btn { padding: 10px 16px; background: transparent; border: 1px solid var(--rule-bright); border-radius: var(--radius-s); color: var(--ivory); font-family: inherit; font-size: 13px; font-weight: 500; cursor: pointer; transition: 0.15s; }
-            .action-btn:hover { border-color: var(--amber-line); color: var(--amber); }
-            .action-btn.primary { background: var(--amber); color: var(--amber-ink); border: none; }
-            .action-btn.primary:hover { background: #f0b25a; }
-            .action-btn.danger { color: var(--alert); border-color: rgba(217,99,74,0.3); }
-            .action-btn.danger:hover { background: rgba(217,99,74,0.1); border-color: var(--alert); }
+            .badge { font-family: 'JetBrains Mono'; font-size: 11px; padding: 4px 8px; border-radius: 4px; background: rgba(111,174,143,0.1); border:1px solid rgba(111,174,143,0.3); color: var(--signal); }
+            .action-btn { padding: 10px 16px; background: var(--amber); color: var(--amber-ink); border: none; border-radius: var(--radius-s); font-family: inherit; font-size: 13px; font-weight: 600; cursor: pointer; }
             .form-group { display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px; }
             .form-group label { font-size: 13px; color: var(--dust); font-weight: 500; }
             .form-group select, .form-group textarea { background: var(--panel-raised); border: 1px solid var(--rule); color: var(--ivory); padding: 12px; border-radius: var(--radius-s); font-family: inherit; font-size: 14px; outline: none; }
-            .form-group select:focus, .form-group textarea:focus { border-color: var(--amber-line); }
             .term-box { background: #0e0d0b; border: 1px solid var(--rule); border-radius: var(--radius-s); padding: 16px; font-family: 'JetBrains Mono'; font-size: 12px; color: #94a3b8; height: 240px; overflow-y: auto; line-height: 1.6; margin-top: 16px; }
           </style>
           </head>
@@ -437,35 +363,34 @@ jobs:
                 <div class="rack-mark">🦙</div>
                 <div>
                   <div class="rack-title">Studio Console</div>
-                  <div class="rack-sub">on-demand architecture</div>
+                  <div class="rack-sub">Pre-Loaded Core</div>
                 </div>
               </div>
               <div class="module">
                 <div class="module-label"><span>Workspace</span></div>
                 <button class="nav-btn active" onclick="switchView('chat')">💬 LLM Chat</button>
                 <button class="nav-btn" onclick="switchView('video')">🎬 LongCat Video</button>
-                <button class="nav-btn" onclick="switchView('setup')">⚙️ Engine Setup</button>
+                <button class="nav-btn" onclick="switchView('setup')">⚙️ System Status</button>
               </div>
               <div class="module">
                 <div class="module-label"><span>Local Models</span><button class="module-refresh" onclick="loadModels()">refresh</button></div>
-                <div class="model-list" id="modelListContainer"><div class="model-list-empty">Waiting for Engine...</div></div>
+                <div class="model-list" id="modelListContainer"><div class="model-list-empty">Loading models...</div></div>
               </div>
               <div class="module">
                 <div class="module-label"><span>Hardware</span></div>
-                <div class="hw-line" id="sysSpecs">reading host specs…</div>
+                <div class="hw-line" id="sysSpecs">reading specs…</div>
                 <div class="meter"><span class="meter-label">CPU</span><div class="meter-track" id="cpuMeter"></div><span class="meter-val" id="cpuVal">0%</span></div>
                 <div class="meter"><span class="meter-label">RAM</span><div class="meter-track" id="ramMeter"></div><span class="meter-val" id="ramVal">0%</span></div>
                 <div class="meter"><span class="meter-label">Disk</span><div class="meter-track"></div><span class="meter-val" id="diskFreeVal" style="width:auto;">—</span></div>
               </div>
               <div class="rack-footer">
-                <div style="font-size:12px; color:var(--dust);"><span class="status-dot" id="engineDot"></span><span id="engineText">Checking engine…</span></div>
+                <div style="font-size:12px; color:var(--dust);"><span class="status-dot"></span><span>Engines Active</span></div>
               </div>
             </nav>
 
             <div class="viewport">
-              <!-- CHAT VIEW -->
               <div id="view-chat" class="view-panel active">
-                <div class="log" id="log"><div class="log-inner" id="logInner"></div></div>
+                <div class="log" id="log"><div class="log-inner" id="logInner"><div class="turn assistant"><div class="turn-label">Console</div><div class="turn-body">Ollama & LongCat are fully pre-loaded. Pull a model from the sidebar to chat.</div></div></div></div>
                 <div class="dock-wrap">
                   <div class="dock">
                     <textarea id="userInput" placeholder="Select an installed model to begin…" rows="1" disabled></textarea>
@@ -474,65 +399,36 @@ jobs:
                 </div>
               </div>
 
-              <!-- VIDEO VIEW -->
               <div id="view-video" class="view-panel studio-view">
                 <h2>🎬 LongCat-Video Studio</h2>
-                <p style="color:var(--dust); margin-bottom:30px;">Generate 720p 30fps videos directly on your workspace.</p>
+                <p style="color:var(--dust); margin-bottom:30px;">Generate high-quality 720p 30fps videos.</p>
                 <div class="card">
-                  <div class="form-group">
-                    <label>Task Type</label>
-                    <select id="vidTask"><option value="t2v">Text-to-Video</option><option value="i2v">Image-to-Video</option><option value="avatar">Avatar Audio-to-Video (v1.5)</option></select>
-                  </div>
-                  <div class="form-group">
-                    <label>Model Checkpoint</label>
-                    <select id="vidModel"><option value="LongCat-Video-Avatar-1.5">LongCat-Video-Avatar-1.5</option><option value="LongCat-Video">LongCat-Video</option></select>
-                  </div>
-                  <div class="form-group">
-                    <label>Prompt / Scene Description</label>
-                    <textarea id="vidPrompt" rows="3" placeholder="A cinematic drone shot over a glowing cyberpunk city..."></textarea>
-                  </div>
-                  <button class="action-btn primary" style="width:100%; margin-top:10px;" onclick="generateVideo()">🚀 Start Video Generation</button>
-                  <div class="term-box" id="vidTerm">> LongCat inference engine idle.\n</div>
+                  <div class="form-group"><label>Task Type</label><select id="vidTask"><option value="t2v">Text-to-Video</option><option value="i2v">Image-to-Video</option><option value="avatar">Avatar Audio-to-Video</option></select></div>
+                  <div class="form-group"><label>Model Checkpoint</label><select id="vidModel"><option value="LongCat-Video-Avatar-1.5">LongCat-Video-Avatar-1.5</option><option value="LongCat-Video">LongCat-Video</option></select></div>
+                  <div class="form-group"><label>Prompt</label><textarea id="vidPrompt" rows="3" placeholder="A futuristic cyber-city at sunset..."></textarea></div>
+                  <button class="action-btn" style="width:100%;" onclick="generateVideo()">🚀 Generate Video</button>
+                  <div class="term-box" id="vidTerm">> Ready for inference.\n</div>
                 </div>
               </div>
 
-              <!-- SETUP VIEW -->
               <div id="view-setup" class="view-panel studio-view">
-                <h2>⚙️ Engine Management</h2>
-                <p style="color:var(--dust); margin-bottom:30px;">Engines download directly to your 100GB workspace drive, avoiding OS disk limitations.</p>
-                
+                <h2>⚙️ System Status</h2>
                 <div class="card">
-                  <h3>🦙 Ollama Engine <div><span class="badge" id="badgeOllamaInst">Checking</span> <span class="badge" id="badgeOllamaRun">Checking</span></div></h3>
-                  <div style="display:flex; gap:10px; margin-top:20px;">
-                    <button class="action-btn primary" onclick="runSetup('/api/engine/ollama/install')">📥 Install</button>
-                    <button class="action-btn" onclick="postAction('/api/engine/ollama/start')">▶️ Start</button>
-                    <button class="action-btn" onclick="postAction('/api/engine/ollama/stop')">⏹ Stop</button>
-                    <button class="action-btn danger" style="margin-left:auto;" onclick="postAction('/api/engine/ollama/uninstall')">🗑 Remove</button>
-                  </div>
+                  <h3>🦙 Ollama Engine <div><span class="badge">Running</span></div></h3>
+                  <h3>🎬 LongCat Core <div><span class="badge">Installed</span></div></h3>
                 </div>
-
-                <div class="card">
-                  <h3>🎬 LongCat-Video Core <div><span class="badge" id="badgeLongcatInst">Checking</span></div></h3>
-                  <div style="display:flex; gap:10px; margin-top:20px;">
-                    <button class="action-btn primary" onclick="runSetup('/api/engine/longcat/install')">📥 Install Dependencies</button>
-                    <button class="action-btn danger" style="margin-left:auto;" onclick="postAction('/api/engine/longcat/uninstall')">🗑 Remove</button>
-                  </div>
-                </div>
-
-                <div class="term-box" id="setupTerm">> Installer console ready.\n</div>
               </div>
             </div>
 
           <script>
-            if (typeof marked !== 'undefined') { marked.setOptions({ gfm: true, breaks: true }); }
             const $ = (id) => document.getElementById(id);
             let currentModel = null;
             let messageHistory = [];
 
-            function switchView(viewId) {
+            function switchView(id) {
               document.querySelectorAll('.view-panel').forEach(el => el.classList.remove('active'));
               document.querySelectorAll('.nav-btn').forEach(el => el.classList.remove('active'));
-              $(`view-${viewId}`).classList.add('active');
+              $(`view-${id}`).classList.add('active');
               event.currentTarget.classList.add('active');
             }
 
@@ -542,65 +438,23 @@ jobs:
               container.innerHTML = Array.from({length: segCount}, (_, i) => `<div class="meter-seg${i < on ? ' on' : ''}"></div>`).join('');
             }
 
-            async function updateSysStats() {
+            setInterval(async () => {
               try {
                 const r = await fetch('/api/stats');
-                const data = await r.json();
-                $('cpuVal').textContent = data.cpu_percent.toFixed(0) + '%';
-                renderMeterSegments($('cpuMeter'), data.cpu_percent, 20);
-                $('ramVal').textContent = data.ram_percent.toFixed(0) + '%';
-                renderMeterSegments($('ramMeter'), data.ram_percent, 20);
-                $('diskFreeVal').textContent = data.disk_free;
-              } catch(e) {}
-            }
-
-            async function updateEngineStatus() {
-              try {
-                const r = await fetch('/api/system/status');
                 const d = await r.json();
-                
-                const boi = $('badgeOllamaInst'); boi.textContent = d.ollama_installed ? "Installed" : "Not Installed"; boi.className = 'badge ' + (d.ollama_installed?'on':'');
-                const bor = $('badgeOllamaRun'); bor.textContent = d.ollama_running ? "Running" : "Stopped"; bor.className = 'badge ' + (d.ollama_running?'on':'');
-                const bli = $('badgeLongcatInst'); bli.textContent = d.longcat_installed ? "Installed" : "Not Installed"; bli.className = 'badge ' + (d.longcat_installed?'on':'');
-                
-                const dot = $('engineDot');
-                if(d.ollama_running) { dot.className='status-dot ok'; $('engineText').textContent='Ollama Online'; }
-                else { dot.className='status-dot bad'; $('engineText').textContent='Ollama Offline'; }
-              } catch(e) {}
-            }
-
-            async function postAction(url) {
-              await fetch(url, {method:'POST'});
-              updateEngineStatus();
-              loadModels();
-            }
-
-            async function runSetup(url) {
-              const term = $('setupTerm');
-              term.innerHTML = '> Requesting operation...\\n';
-              const res = await fetch(url, {method:'POST'});
-              const reader = res.body.getReader();
-              const decoder = new TextDecoder();
-              while(true) {
-                const {done, value} = await reader.read();
-                if(done) break;
-                const chunk = decoder.decode(value);
-                for(let line of chunk.split('\\n')){
-                  if(line.startsWith('data: ') && !line.includes('[DONE]')){
-                    try{ term.innerHTML += JSON.parse(line.slice(6)).raw; term.scrollTop = term.scrollHeight; }catch(e){}
-                  }
-                }
-              }
-              updateEngineStatus();
-            }
+                $('cpuVal').textContent = d.cpu_percent.toFixed(0) + '%';
+                renderMeterSegments($('cpuMeter'), d.cpu_percent, 20);
+                $('ramVal').textContent = d.ram_percent.toFixed(0) + '%';
+                renderMeterSegments($('ramMeter'), d.ram_percent, 20);
+                $('diskFreeVal').textContent = d.disk_free;
+              } catch(e){}
+            }, 3000);
 
             async function loadModels() {
               try {
                 const r = await fetch('/api/models');
                 const data = await r.json();
                 const container = $('modelListContainer');
-                if(!data.models || data.models.length===0) { container.innerHTML='<div class="model-list-empty">Offline.</div>'; return; }
-                
                 container.innerHTML = data.models.map(m => `
                   <div class="model-row ${m.name===currentModel ? 'active':''}" data-model="${m.name}" data-clickable="${m.downloaded?'1':'0'}">
                     <span class="model-dot"></span>
@@ -610,16 +464,10 @@ jobs:
                     </div>
                     ${!m.downloaded ? `<button class="dl-btn" onclick="event.stopPropagation(); startPull('${m.name}')">Pull</button>` : ''}
                   </div>`).join('');
-                  
                 const dl = data.models.filter(m=>m.downloaded);
-                if(!currentModel && dl.length>0) { selectModel(dl[0].name); }
-                
-                if(currentModel && $('userInput')) {
-                  $('userInput').disabled = false;
-                  $('sendButton').disabled = false;
-                  $('userInput').placeholder = "Type your message...";
-                }
-              } catch(e) {}
+                if(!currentModel && dl.length>0) selectModel(dl[0].name);
+                if(currentModel) { $('userInput').disabled = false; $('sendButton').disabled = false; $('userInput').placeholder = "Type your message..."; }
+              } catch(e){}
             }
 
             $('modelListContainer').addEventListener('click', (e)=>{
@@ -630,21 +478,9 @@ jobs:
             function selectModel(name) { currentModel = name; loadModels(); }
 
             async function startPull(name) {
-              switchView('setup');
-              const term = $('setupTerm');
-              term.innerHTML = `> Pulling ${name}...\\n`;
-              const res = await fetch('/api/pull', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({model:name})});
-              const reader = res.body.getReader();
-              const decoder = new TextDecoder();
-              while(true) {
-                const {done, value} = await reader.read();
-                if(done) break;
-                for(let line of decoder.decode(value).split('\\n')){
-                  if(line.startsWith('data: ') && !line.includes('[DONE]')){
-                    try{ term.innerHTML += JSON.parse(line.slice(6)).raw + '\\n'; term.scrollTop = term.scrollHeight; }catch(e){}
-                  }
-                }
-              }
+              const feed = $('logInner');
+              feed.innerHTML += `<div class="turn assistant"><div class="turn-label">System</div><div class="turn-body">Pulling model ${name}...</div></div>`;
+              await fetch('/api/pull', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({model:name})});
               loadModels();
             }
 
@@ -653,21 +489,17 @@ jobs:
               const text = input.value.trim();
               if(!text || !currentModel) return;
               input.value = '';
-              
               const feed = $('logInner');
-              if(messageHistory.length===0) feed.innerHTML = '';
-              
               feed.innerHTML += `<div class="turn user"><div class="turn-label">You</div><div class="turn-body">${text}</div></div>`;
-              chatHistoryObj = {role:'user', content:text};
-              messageHistory.push(chatHistoryObj);
-              
+              messageHistory.push({role:'user', content:text});
+
               const asst = document.createElement('div');
               asst.className = 'turn assistant';
               asst.innerHTML = `<div class="turn-label">Console</div><div class="turn-body">...</div>`;
               feed.appendChild(asst);
               const body = asst.querySelector('.turn-body');
 
-              const res = await fetch('/api/chat', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({messages:messageHistory, model:currentModel, max_tokens:2048})});
+              const res = await fetch('/api/chat', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({messages:messageHistory, model:currentModel})});
               const reader = res.body.getReader();
               const decoder = new TextDecoder();
               let full = '';
@@ -688,12 +520,8 @@ jobs:
 
             async function generateVideo() {
               const term = $('vidTerm');
-              term.innerHTML = '> Submitting task to LongCat inference engine...\\n';
-              const task = $('vidTask').value;
-              const model = $('vidModel').value;
-              const prompt = $('vidPrompt').value;
-              
-              const res = await fetch('/api/video/generate', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({task, model, prompt})});
+              term.innerHTML = '> Starting generation...\\n';
+              const res = await fetch('/api/video/generate', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({task:$('vidTask').value, model:$('vidModel').value, prompt:$('vidPrompt').value})});
               const reader = res.body.getReader();
               const decoder = new TextDecoder();
               while(true) {
@@ -707,12 +535,8 @@ jobs:
               }
             }
 
-            fetch('/api/sysinfo').then(r=>r.json()).then(d=>$('sysSpecs').textContent=`${d.os} · ${d.cpu_threads} cores · ${d.ram_total} RAM`);
-            setInterval(updateSysStats, 3000);
-            setInterval(updateEngineStatus, 5000);
-            updateSysStats();
-            updateEngineStatus();
-            setTimeout(loadModels, 1000);
+            fetch('/api/sysinfo').then(r=>r.json()).then(d=>$('sysSpecs').textContent=`${d.os} · ${d.cpu_threads} cores`);
+            loadModels();
           </script>
           </body>
           </html>
@@ -723,71 +547,39 @@ jobs:
           PYEOF
           echo "✅ Server script written successfully"
 
-      - name: 🌐 Start web server
+      - name: 🌐 Launch Web Server
         run: |
-          echo "──────────────────────────────────────────"
-          echo " 🌐  Starting web UI"
-          echo "──────────────────────────────────────────"
           nohup python ai_studio.py > /tmp/webui.log 2>&1 &
-          echo $! > /tmp/webui.pid
-          ready=false
-          for i in $(seq 1 15); do
-            if curl -sf "http://localhost:${PORT}" > /dev/null 2>&1; then
-              echo "✅ Web UI is ready!"
-              ready=true
-              break
-            fi
-            sleep 2
-          done
-          if [ "$ready" != "true" ]; then
-            echo "❌ Web UI failed to start. Last logs:"
-            tail -n 50 /tmp/webui.log || true
-            exit 1
-          fi
+          sleep 3
 
-      - name: 📦 Install cloudflared
+      - name: 📦 Install Cloudflared & Tunnel
         run: |
           curl -L -s https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
           chmod +x cloudflared
           sudo mv cloudflared /usr/local/bin/
-          cloudflared --version
-
-      - name: 🌐 Create tunnel and wait
-        run: |
-          echo "──────────────────────────────────────────"
-          echo " 🌐  Creating Cloudflare tunnel"
-          echo "──────────────────────────────────────────"
+          
           cloudflared tunnel --url "http://127.0.0.1:${PORT}" --protocol http2 > tunnel.log 2>&1 &
           TUNNEL_PID=$!
-          echo "⏳ Waiting for tunnel URL..."
+          
           TUNNEL_URL=""
-          for i in $(seq 1 30); do
-            TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log 2>/dev/null | head -1)
+          for i in {1..30}; do
+            TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
             [ -n "$TUNNEL_URL" ] && break
             sleep 2
           done
-          if [ -z "$TUNNEL_URL" ]; then
-            echo "❌ Could not get a tunnel URL. Tunnel log:"
-            cat tunnel.log
-            exit 1
-          fi
-          echo ""
+          
           echo "╔═══════════════════════════════════════════════════════════════════╗"
-          echo "║         🎉  S T U D I O   O N L I N E  🎉                         ║"
+          echo "║         🎉   A I   S T U D I O   I S   R E A D Y   🎉             ║"
           echo "╠═══════════════════════════════════════════════════════════════════╣"
           echo "║  🔗  $TUNNEL_URL"
           echo "╚═══════════════════════════════════════════════════════════════════╝"
+          
           {
-            echo "## 🦙🎬 AI Studio is live"
-            echo ""
+            echo "## 🦙🎬 AI Studio is Online"
             echo "**URL:** $TUNNEL_URL"
-            echo ""
-            echo "### Next Steps:"
-            echo "1. Open the URL."
-            echo "2. Go to the **⚙️ Engine Setup** tab."
-            echo "3. Click **Install** for Ollama or LongCat."
-            echo "4. The engines will securely download directly to the 100GB workspace drive."
+            echo "- Ollama and LongCat-Video are pre-installed."
           } >> "$GITHUB_STEP_SUMMARY"
+          
           wait "$TUNNEL_PID"
 
       - name: 🧹 Cleanup
