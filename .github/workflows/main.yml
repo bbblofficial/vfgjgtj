@@ -1,5 +1,5 @@
-name: 🦙 Local LLM Web Interface (Optimized)
-on:  
+name: 🦙 Local LLM + Image Model Web Interface (Optimized)
+on:
   workflow_dispatch:
     inputs:
       port:
@@ -50,7 +50,8 @@ jobs:
           curl -fsSL https://ollama.com/install.sh | sh
           pip install --no-cache-dir \
             fastapi uvicorn aiohttp httpx python-multipart \
-            jinja2 websockets pydantic psutil
+            jinja2 websockets pydantic psutil \
+            huggingface-hub
           ollama --version
           python --version
       - name: 🚀 Start Ollama server
@@ -77,7 +78,7 @@ jobs:
             tail -n 50 /tmp/ollama.log || true
             exit 1
           fi
-      - name: 🔧 Write the web server (Glassmorphism UI)
+      - name: 🔧 Write the web server (Full Markdown + Math + Image Models)
         run: |
           cat << 'PYEOF' > ollama_server.py
           import json
@@ -99,7 +100,6 @@ jobs:
           CONTEXT_SIZE = int(os.getenv("CONTEXT_SIZE", "4096"))
           PORT = int(os.getenv("PORT", "7860"))
           
-          # The Perfect System Prompt for LLMs
           SYSTEM_PROMPT = """You are a highly capable, expert AI assistant. Your primary goal is to be exceptionally helpful, accurate, and clear. 
           Follow these guidelines:
           - Provide direct, concise answers without unnecessary filler.
@@ -108,8 +108,10 @@ jobs:
           - Be objective, polite, and neutral in your tone.
           - If you do not know the answer, admit it rather than hallucinating information."""
 
-          app = FastAPI(title="Local LLM UI (Optimized)")
+          app = FastAPI(title="Local LLM + Image Model UI (Optimized)")
+
           CATALOG_MODELS = [
+              # ---- Ollama LLMs ----
               {"name": "qwen2.5:0.5b", "type": "general"},
               {"name": "qwen2.5:1.5b", "type": "general"},
               {"name": "qwen2.5:3b", "type": "general"},
@@ -216,8 +218,20 @@ jobs:
               {"name": "mistral:7b-text-q8_0", "type": "general"},
               {"name": "mistral:7b-text-v0.2-q8_0", "type": "general"},
               {"name": "mistral:7b-text-fp16", "type": "general"},
-              {"name": "mistral:7b-text-v0.2-fp16", "type": "general"}
+              {"name": "mistral:7b-text-v0.2-fp16", "type": "general"},
+
+              # ---- External Image Models (Hugging Face) ----
+              {"name": "Ideogram 4.0 Quality", "type": "image", "source": "huggingface", "repo": "ideogram-ai/ideogram-4.0"},
+              {"name": "Hunyuan Image 3.0", "type": "image", "source": "huggingface", "repo": "Tencent/HunyuanDiT"},
+              {"name": "FLUX 2 Dev", "type": "image", "source": "huggingface", "repo": "black-forest-labs/FLUX.1-dev"},
+              {"name": "Qwen Image 2512", "type": "image", "source": "huggingface", "repo": "Qwen/Qwen-VL"},
+              {"name": "HiDream O1 Image", "type": "image", "source": "huggingface", "repo": "HiDream-ai/HiDream-I1"},
           ]
+
+          EXTERNAL_MODEL_MAP = {
+              item["name"]: item for item in CATALOG_MODELS if item.get("type") == "image"
+          }
+
           class ChatMessage(BaseModel):
               role: str
               content: str
@@ -229,6 +243,7 @@ jobs:
               max_tokens: Optional[int] = 2048
           class PullRequest(BaseModel):
               model: str
+
           @app.get("/api/health")
           async def health():
               try:
@@ -239,6 +254,7 @@ jobs:
               except Exception as exc:
                   logger.error(f"Health check failed: {exc}")
                   raise HTTPException(status_code=503, detail=str(exc))
+
           @app.get("/api/sysinfo")
           def sysinfo():
               try:
@@ -249,6 +265,7 @@ jobs:
                   }
               except Exception:
                   return {"cpu_threads": 4, "ram_total": "16.0 GB", "os": "Linux"}
+
           @app.get("/api/stats")
           def stats():
               try:
@@ -261,6 +278,7 @@ jobs:
                   }
               except Exception:
                   return {"cpu_percent": 0.0, "ram_percent": 0.0, "ram_used": "0 GB", "disk_free": "100 GB free"}
+
           @app.get("/api/models")
           async def list_models():
               try:
@@ -273,6 +291,13 @@ jobs:
                               pulled_names = {m["name"] for m in data.get("models", [])}
                       except Exception as inner_exc:
                           logger.warning(f"Could not reach Ollama for tags: {inner_exc}")
+                  
+                  for item in CATALOG_MODELS:
+                      if item.get("type") == "image":
+                          model_path = f"/models/{item['name'].replace(' ', '_')}"
+                          if os.path.exists(model_path) and os.path.isdir(model_path):
+                              pulled_names.add(item["name"])
+                  
                   models_payload = []
                   for item in CATALOG_MODELS:
                       name = item["name"]
@@ -285,12 +310,19 @@ jobs:
               except Exception as exc:
                   logger.error(f"List models failed: {exc}")
                   raise HTTPException(status_code=503, detail=str(exc))
+
           @app.post("/api/pull")
           async def pull_model(req: PullRequest):
+              if req.model in EXTERNAL_MODEL_MAP:
+                  return await pull_external_model(req.model)
+              else:
+                  return await pull_ollama_model(req.model)
+
+          async def pull_ollama_model(model_name: str):
               async def generate_pull():
                   try:
                       process = subprocess.Popen(
-                          ["ollama", "pull", req.model],
+                          ["ollama", "pull", model_name],
                           stdout=subprocess.PIPE,
                           stderr=subprocess.STDOUT,
                           text=True
@@ -316,12 +348,64 @@ jobs:
                   except Exception as e:
                       yield f"data: {json.dumps({'error': str(e)})}\n\n"
               return StreamingResponse(generate_pull(), media_type="text/event-stream")
+
+          async def pull_external_model(model_name: str):
+              repo_info = EXTERNAL_MODEL_MAP.get(model_name)
+              if not repo_info:
+                  async def error_gen():
+                      yield f"data: {json.dumps({'error': 'Unknown external model'})}\n\n"
+                      yield "data: [DONE]\n\n"
+                  return StreamingResponse(error_gen(), media_type="text/event-stream")
+              
+              repo_id = repo_info.get("repo")
+              target_dir = f"/models/{model_name.replace(' ', '_')}"
+              
+              async def generate_pull():
+                  try:
+                      os.makedirs(target_dir, exist_ok=True)
+                      cmd = ["huggingface-cli", "download", repo_id, "--local-dir", target_dir, "--local-dir-use-symlinks", "False"]
+                      process = subprocess.Popen(
+                          cmd,
+                          stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT,
+                          text=True
+                      )
+                      for line in process.stdout:
+                          line_str = line.strip()
+                          if not line_str:
+                              continue
+                          percent = None
+                          if "%" in line_str:
+                              parts = line_str.split()
+                              for p in parts:
+                                  if p.endswith("%"):
+                                      try:
+                                          percent = int(p.rstrip("%"))
+                                      except ValueError:
+                                          pass
+                          yield f"data: {json.dumps({'raw': line_str, 'percent': percent})}\n\n"
+                      process.wait()
+                      if process.returncode != 0:
+                          yield f"data: {json.dumps({'error': f'Download failed with code {process.returncode}'})}\n\n"
+                      else:
+                          yield f"data: {json.dumps({'raw': '✅ Download complete!', 'percent': 100})}\n\n"
+                      yield "data: [DONE]\n\n"
+                  except Exception as e:
+                      yield f"data: {json.dumps({'error': str(e)})}\n\n"
+              return StreamingResponse(generate_pull(), media_type="text/event-stream")
+
           @app.get("/", response_class=HTMLResponse)
           async def root():
               return HTML_TEMPLATE
+
           @app.post("/api/chat")
           async def chat(request: ChatRequest):
-              # Inject the Perfect System Prompt at the start of every request
+              if request.model in EXTERNAL_MODEL_MAP:
+                  async def error_gen():
+                      yield f"data: {json.dumps({'error': f'Model "{request.model}" is an image generator, not a chat LLM.'})}\n\n"
+                      yield "data: [DONE]\n\n"
+                  return StreamingResponse(error_gen(), media_type="text/event-stream")
+              
               ollama_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
               for m in request.messages:
                   msg_dict = {"role": m.role, "content": m.content}
@@ -370,6 +454,7 @@ jobs:
                       yield f"data: {json.dumps({'error': str(exc)})}\n\n"
                   yield "data: [DONE]\n\n"
               return StreamingResponse(generate(), media_type="text/event-stream")
+
           HTML_TEMPLATE = r"""<!DOCTYPE html>
           <html lang="en">
           <head>
@@ -379,7 +464,19 @@ jobs:
           <link rel="preconnect" href="https://fonts.googleapis.com">
           <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
           <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-          <script src="https://cdn.jsdelivr.net/npm/marked@4.3.0/marked.min.js"></script>
+          <!-- KaTeX for math rendering -->
+          <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css" crossorigin="anonymous">
+          <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js" crossorigin="anonymous"></script>
+          <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js" crossorigin="anonymous"></script>
+          
+          <!-- markdown-it + full plugin set -->
+          <script src="https://cdn.jsdelivr.net/npm/markdown-it@14.0.0/dist/markdown-it.min.js"></script>
+          <script src="https://cdn.jsdelivr.net/npm/markdown-it-footnote@3.0.3/dist/markdown-it-footnote.min.js"></script>
+          <script src="https://cdn.jsdelivr.net/npm/markdown-it-deflist@2.1.0/dist/markdown-it-deflist.min.js"></script>
+          <script src="https://cdn.jsdelivr.net/npm/markdown-it-abbr@1.0.4/dist/markdown-it-abbr.min.js"></script>
+          <script src="https://cdn.jsdelivr.net/npm/markdown-it-emoji@2.0.2/dist/markdown-it-emoji.min.js"></script>
+          <script src="https://cdn.jsdelivr.net/npm/markdown-it-task-lists@2.1.1/dist/markdown-it-task-lists.min.js"></script>
+          <script src="https://cdn.jsdelivr.net/npm/markdown-it-container@3.0.0/dist/markdown-it-container.min.js"></script>
           <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.6/purify.min.js"></script>
           <link id="hljsTheme" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css">
           <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
@@ -471,6 +568,7 @@ jobs:
               border: 1px solid var(--rule-bright); color: var(--dust);
             }
             .model-chip.vision { color: var(--signal); border-color: rgba(111,174,143,0.4); }
+            .model-chip.image { color: #c084fc; border-color: rgba(192,132,252,0.4); }
             .dl-btn {
               background: transparent; border: 1px solid var(--rule-bright); color: var(--dust);
               padding: 4px 9px; border-radius: var(--radius-s); font-size: 11px; cursor: pointer; flex-shrink: 0;
@@ -723,8 +821,56 @@ jobs:
               </div>
             </div>
           <script>
-            if (typeof marked !== 'undefined') {
-              marked.setOptions({ gfm: true, breaks: true });
+            // Initialize markdown-it with full plugin set
+            const md = markdownit({
+              html: true,
+              linkify: true,
+              typographer: true
+            })
+            .use(markdownitFootnote)
+            .use(markdownitDeflist)
+            .use(markdownitAbbr)
+            .use(markdownitEmoji, { defs: {} })
+            .use(markdownitTaskLists);
+            
+            // Configure DOMPurify to allow all necessary HTML tags and attributes
+            const ALLOWED_TAGS = [
+              'p','br','hr','h1','h2','h3','h4','h5','h6','strong','em','b','i','u','s','strike','del',
+              'a','img','code','pre','blockquote','ul','ol','li','dl','dt','dd','table','thead','tbody',
+              'tr','th','td','caption','sup','sub','details','summary','div','span','abbr','kbd','mark',
+              'section','header','footer','nav','article','aside','figure','figcaption','time','ruby',
+              'rt','rp','bdo','bdi','wbr','iframe','audio','video','source','track','canvas','svg'
+            ];
+            const ALLOWED_ATTR = [
+              'href','target','rel','title','src','alt','width','height','class','id','style',
+              'align','valign','border','cellpadding','cellspacing','colspan','rowspan',
+              'controls','autoplay','loop','muted','poster','preload','playsinline',
+              'data-*','aria-*','role','tabindex'
+            ];
+            DOMPurify.addHook('uponSanitizeAttribute', function(node, data) {
+              if (data.attrName === 'style') {
+                // Allow style attributes but sanitize content (basic)
+                data.attrValue = DOMPurify.sanitize(data.attrValue, { ALLOWED_TAGS: [], ALLOWED_ATTR: [] });
+              }
+            });
+            
+            // KaTeX math rendering helper
+            function renderMath(element) {
+              if (typeof renderMathInElement === 'function') {
+                try {
+                  renderMathInElement(element, {
+                    delimiters: [
+                      {left: '\\[', right: '\\]', display: true},
+                      {left: '\\(', right: '\\)', display: false},
+                      {left: '$$', right: '$$', display: true},
+                      {left: '$', right: '$', display: false}
+                    ],
+                    throwOnError: false
+                  });
+                } catch(e) {
+                  console.warn('Math rendering error:', e);
+                }
+              }
             }
             
             const $ = (id) => document.getElementById(id);
@@ -777,15 +923,25 @@ jobs:
             function renderMarkdown(el, text, loading) {
               if (!el) return;
               try {
-                const html = typeof marked !== 'undefined' ? marked.parse(text || '') : (text || '');
-                const clean = typeof DOMPurify !== 'undefined' ? DOMPurify.sanitize(html) : html;
-                el.innerHTML = clean + (loading ? '<span class="cursor-blink"></span>' : '');
+                // Render markdown with markdown-it
+                let rawHtml = md.render(text || '');
+                // Sanitize with DOMPurify
+                let cleanHtml = DOMPurify.sanitize(rawHtml, {
+                  ALLOWED_TAGS: ALLOWED_TAGS,
+                  ALLOWED_ATTR: ALLOWED_ATTR,
+                  ADD_ATTR: ['target']
+                });
+                el.innerHTML = cleanHtml + (loading ? '<span class="cursor-blink"></span>' : '');
                 
+                // Apply syntax highlighting
                 if (typeof hljs !== 'undefined') {
                   el.querySelectorAll('pre code').forEach((block) => {
                     hljs.highlightElement(block);
                   });
                 }
+                
+                // Render math (KaTeX)
+                renderMath(el);
               } catch (e) {
                 console.error('Markdown rendering error:', e);
                 el.textContent = text || '';
@@ -947,7 +1103,8 @@ jobs:
                 
                 const downloaded = knownModels.filter(m => m.downloaded);
                 if (!currentModel && downloaded.length > 0) {
-                  selectModel(downloaded[0].name);
+                  const nonImage = downloaded.find(m => m.type !== 'image');
+                  if (nonImage) selectModel(nonImage.name);
                 }
                 updateComposerState();
               } catch (e) {
@@ -970,13 +1127,14 @@ jobs:
                 var active = m.name === currentModel;
                 var escapedName = escapeHtml(m.name);
                 var dlHtml = !m.downloaded ? '<button class="dl-btn" data-pull="' + escapedName + '">Pull</button>' : '';
+                var typeClass = m.type === 'image' ? 'image' : m.type;
                 return `
                   <div class="model-row ${active ? ' active' : ''}" data-model="${escapedName}" data-downloaded="${m.downloaded ? '1' : '0'}" data-clickable="${m.downloaded ? '1' : '0'}">
                     <span class="model-dot"></span>
                     <div class="model-meta">
                       <span class="model-name">${escapedName}</span>
                       <div class="model-flags">
-                        <span class="model-chip ${m.type}">${m.type}</span>
+                        <span class="model-chip ${typeClass}">${m.type}</span>
                         <span class="model-chip">${m.downloaded ? 'ready' : 'not pulled'}</span>
                       </div>
                     </div>
@@ -1373,14 +1531,15 @@ jobs:
           echo "║  🔗  $TUNNEL_URL"
           echo "╚═══════════════════════════════════════════════════════════════════╝"
           {
-            echo "## 🦙 Your LLM web UI is live"
+            echo "## 🦙 Your LLM + Image Model Web UI is live"
             echo ""
             echo "**URL:** $TUNNEL_URL"
             echo ""
-            echo "**Catalog Models:** 100+ On-demand downloadable models"
+            echo "**Catalog Models:** 100+ Ollama LLMs + 5 external image models (downloadable from Hugging Face)"
             echo "**Context:** ${CONTEXT_SIZE} tokens"
+            echo "**Markdown:** Full GFM + footnotes, definition lists, abbreviations, emoji, HTML, and KaTeX math"
             echo ""
-            echo "> Models start un-pulled by design and can be downloaded instantly via the sidebar interface on demand."
+            echo "> Image models are listed as `image` type. They cannot be used for chat, but you can download them via the UI."
           } >> "$GITHUB_STEP_SUMMARY"
           wait "$TUNNEL_PID"
       - name: 🧹 Cleanup
