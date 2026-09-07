@@ -368,7 +368,8 @@ jobs:
               async def generate_pull():
                   try:
                       os.makedirs(target_dir, exist_ok=True)
-                      cmd = ["huggingface-cli", "download", repo_id, "--local-dir", target_dir, "--local-dir-use-symlinks", "False"]
+                      # Use the new 'hf' CLI instead of deprecated 'huggingface-cli'
+                      cmd = ["hf", "download", repo_id, "--local-dir", target_dir]
                       process = subprocess.Popen(
                           cmd,
                           stdout=subprocess.PIPE,
@@ -1541,7 +1542,7 @@ jobs:
             echo ""
             echo "**URL:** $TUNNEL_URL"
             echo ""
-            echo "**Catalog Models:** 100+ Ollama LLMs + 5 external image models (downloadable from Hugging Face)"
+            echo "**Catalog Models:** 100+ Ollama LLMs + 5 external image models (downloadable from Hugging Face via 'hf')"
             echo "**Context:** ${CONTEXT_SIZE} tokens"
             echo "**Markdown:** Full GFM + footnotes, definition lists, abbreviations, emoji, HTML, and KaTeX math"
             echo ""
