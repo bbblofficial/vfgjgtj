@@ -149,14 +149,14 @@ jobs:
           @app.post("/api/engine/ollama/install")
           async def install_ollama():
               async def stream():
-                  yield f"data: {json.dumps({'raw': '🚀 Downloading Ollama...\\n'})}\n\n"
+                  yield "data: " + json.dumps({"raw": "🚀 Downloading Ollama...\n"}) + "\n\n"
                   cmd = f"curl -L https://ollama.com/download/ollama-linux-amd64 -o {OLLAMA_BIN} && chmod +x {OLLAMA_BIN}"
                   proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
                   for line in proc.stdout:
-                      yield f"data: {json.dumps({'raw': line})}\n\n"
+                      yield "data: " + json.dumps({"raw": line}) + "\n\n"
                   proc.wait()
                   os.makedirs(OLLAMA_MODELS, exist_ok=True)
-                  yield f"data: {json.dumps({'raw': '✅ Ollama Installed! Click Start Engine.\\n'})}\n\n"
+                  yield "data: " + json.dumps({"raw": "✅ Ollama Installed! Click Start Engine.\n"}) + "\n\n"
                   yield "data: [DONE]\n\n"
               return StreamingResponse(stream(), media_type="text/event-stream")
 
@@ -187,7 +187,7 @@ jobs:
           @app.post("/api/engine/longcat/install")
           async def install_longcat():
               async def stream():
-                  yield f"data: {json.dumps({'raw': '🚀 Cloning LongCat-Video repository...\\n'})}\n\n"
+                  yield "data: " + json.dumps({"raw": "🚀 Cloning LongCat-Video repository...\n"}) + "\n\n"
                   cmd = f"""
                   git clone --single-branch --branch main https://github.com/meituan-longcat/LongCat-Video.git {LONGCAT_DIR} &&
                   cd {LONGCAT_DIR} &&
@@ -200,12 +200,12 @@ jobs:
                   """
                   proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
                   for line in proc.stdout:
-                      yield f"data: {json.dumps({'raw': line})}\n\n"
+                      yield "data: " + json.dumps({"raw": line}) + "\n\n"
                   proc.wait()
                   if proc.returncode == 0:
-                      yield f"data: {json.dumps({'raw': '✅ LongCat Installed successfully!\\n'})}\n\n"
+                      yield "data: " + json.dumps({"raw": "✅ LongCat Installed successfully!\n"}) + "\n\n"
                   else:
-                      yield f"data: {json.dumps({'raw': '❌ Installation failed.\\n'})}\n\n"
+                      yield "data: " + json.dumps({"raw": "❌ Installation failed.\n"}) + "\n\n"
                   yield "data: [DONE]\n\n"
               return StreamingResponse(stream(), media_type="text/event-stream")
 
@@ -275,11 +275,11 @@ jobs:
                                   if p.endswith("%"):
                                       try: percent = int(p.rstrip("%"))
                                       except: pass
-                          yield f"data: {json.dumps({'raw': line_str, 'percent': percent})}\n\n"
+                          yield "data: " + json.dumps({"raw": line_str, "percent": percent}) + "\n\n"
                       process.wait()
                       yield "data: [DONE]\n\n"
                   except Exception as e:
-                      yield f"data: {json.dumps({'error': str(e)})}\n\n"
+                      yield "data: " + json.dumps({"error": str(e)}) + "\n\n"
               return StreamingResponse(generate_pull(), media_type="text/event-stream")
 
           @app.post("/api/chat")
@@ -294,7 +294,7 @@ jobs:
                                     "options": {"temperature": request.temperature, "num_predict": request.max_tokens, "num_ctx": CONTEXT_SIZE}}
                           ) as response:
                               if response.status_code != 200:
-                                  yield f"data: {json.dumps({'error': 'Engine error'})}\n\n"
+                                  yield "data: " + json.dumps({"error": "Engine error"}) + "\n\n"
                                   yield "data: [DONE]\n\n"
                                   return
                               async for line in response.aiter_lines():
@@ -302,18 +302,20 @@ jobs:
                                   if not line: continue
                                   try:
                                       obj = json.loads(line)
-                                      if obj.get("error"): yield f"data: {json.dumps({'error': obj['error']})}\n\n"
-                                      elif obj.get("message", {}).get("content"): yield f"data: {json.dumps({'content': obj['message']['content']})}\n\n"
+                                      if obj.get("error"): yield "data: " + json.dumps({"error": obj["error"]}) + "\n\n"
+                                      elif obj.get("message", {}).get("content"): yield "data: " + json.dumps({"content": obj["message"]["content"]}) + "\n\n"
                                   except: continue
                   except Exception as exc:
-                      yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+                      yield "data: " + json.dumps({"error": str(exc)}) + "\n\n"
                   yield "data: [DONE]\n\n"
               return StreamingResponse(generate(), media_type="text/event-stream")
 
           @app.post("/api/video/generate")
           async def generate_video(req: VideoGenRequest):
               async def stream():
-                  yield f"data: {json.dumps({'raw': f'🚀 Initializing LongCat inference for task: {req.task}\\n'})}\n\n"
+                  init_msg = f"🚀 Initializing LongCat inference for task: {req.task}\n"
+                  yield "data: " + json.dumps({"raw": init_msg}) + "\n\n"
+                  
                   script = "run_demo_text_to_video.py"
                   if req.task == "i2v": script = "run_demo_image_to_video.py"
                   elif req.task == "avatar": script = "run_demo_avatar_single_audio_to_video.py"
@@ -323,7 +325,7 @@ jobs:
 
                   proc = subprocess.Popen(cmd, cwd=LONGCAT_DIR, env=os.environ, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
                   for line in proc.stdout:
-                      yield f"data: {json.dumps({'raw': line.strip() + '\\n'})}\n\n"
+                      yield "data: " + json.dumps({"raw": line.strip() + "\n"}) + "\n\n"
                   proc.wait()
                   yield "data: [DONE]\n\n"
               return StreamingResponse(stream(), media_type="text/event-stream")
