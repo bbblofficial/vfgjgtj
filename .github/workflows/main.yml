@@ -13,8 +13,9 @@ on:
         default: '4096'
         type: string
       hf_token:
-        description: '🔑 Hugging Face Token (Required for gated models like FLUX)'
+        description: '🔑 Hugging Face Token (Required for FLUX)'
         required: false
+        default: ''
         type: string
 permissions:
   contents: read
@@ -28,7 +29,7 @@ jobs:
     env:
       CONTEXT_SIZE: ${{ inputs.context_size }}
       PORT: ${{ inputs.port }}
-      HF_TOKEN: ${{ inputs.hf_token || secrets.HF_TOKEN }}
+      HF_TOKEN: ${{ inputs.hf_token }}
     steps:
       - name: 🦙 Show banner
         run: |
@@ -198,37 +199,6 @@ jobs:
               {"name": "mistral:7b-instruct-v0.3-q8_0", "type": "general"},
               {"name": "mistral:7b-instruct-fp16", "type": "general"},
               {"name": "mistral:7b-instruct-v0.3-fp16", "type": "general"},
-              {"name": "mistral:7b-text", "type": "general"},
-              {"name": "mistral:7b-text-q2_K", "type": "general"},
-              {"name": "mistral:7b-text-v0.2-q2_K", "type": "general"},
-              {"name": "mistral:7b-text-q3_K_S", "type": "general"},
-              {"name": "mistral:7b-text-v0.2-q3_K_S", "type": "general"},
-              {"name": "mistral:7b-text-q3_K_M", "type": "general"},
-              {"name": "mistral:7b-text-v0.2-q3_K_M", "type": "general"},
-              {"name": "mistral:7b-text-q3_K_L", "type": "general"},
-              {"name": "mistral:7b-text-v0.2-q3_K_L", "type": "general"},
-              {"name": "mistral:7b-text-q4_0", "type": "general"},
-              {"name": "mistral:7b-text-v0.2-q4_0", "type": "general"},
-              {"name": "mistral:7b-text-q4_1", "type": "general"},
-              {"name": "mistral:7b-text-v0.2-q4_1", "type": "general"},
-              {"name": "mistral:7b-text-q4_K_S", "type": "general"},
-              {"name": "mistral:7b-text-v0.2-q4_K_S", "type": "general"},
-              {"name": "mistral:7b-text-q4_K_M", "type": "general"},
-              {"name": "mistral:7b-text-v0.2-q4_K_M", "type": "general"},
-              {"name": "mistral:7b-text-q5_0", "type": "general"},
-              {"name": "mistral:7b-text-v0.2-q5_0", "type": "general"},
-              {"name": "mistral:7b-text-q5_1", "type": "general"},
-              {"name": "mistral:7b-text-v0.2-q5_1", "type": "general"},
-              {"name": "mistral:7b-text-q5_K_S", "type": "general"},
-              {"name": "mistral:7b-text-v0.2-q5_K_S", "type": "general"},
-              {"name": "mistral:7b-text-q5_K_M", "type": "general"},
-              {"name": "mistral:7b-text-v0.2-q5_K_M", "type": "general"},
-              {"name": "mistral:7b-text-q6_K", "type": "general"},
-              {"name": "mistral:7b-text-v0.2-q6_K", "type": "general"},
-              {"name": "mistral:7b-text-q8_0", "type": "general"},
-              {"name": "mistral:7b-text-v0.2-q8_0", "type": "general"},
-              {"name": "mistral:7b-text-fp16", "type": "general"},
-              {"name": "mistral:7b-text-v0.2-fp16", "type": "general"},
 
               # ---- External Image Models (Hugging Face) ----
               {"name": "Ideogram 4.0 Quality", "type": "image", "source": "huggingface", "repo": "ideogram-ai/ideogram-4.0"},
@@ -375,19 +345,16 @@ jobs:
                   try:
                       os.makedirs(target_dir, exist_ok=True)
                       
-                      # Fixed: Use 'hf' CLI and inject HF_TOKEN into the subprocess environment
+                      # Fixed: Pass the HF_TOKEN directly as an argument to the CLI
                       cmd = ["hf", "download", repo_id, "--local-dir", target_dir]
-                      
-                      run_env = os.environ.copy()
                       if HF_TOKEN:
-                          run_env["HF_TOKEN"] = HF_TOKEN
+                          cmd.extend(["--token", HF_TOKEN])
 
                       process = subprocess.Popen(
                           cmd,
                           stdout=subprocess.PIPE,
                           stderr=subprocess.STDOUT,
-                          text=True,
-                          env=run_env
+                          text=True
                       )
                       for line in process.stdout:
                           line_str = line.strip()
@@ -405,7 +372,7 @@ jobs:
                           yield f"data: {json.dumps({'raw': line_str, 'percent': percent})}\n\n"
                       process.wait()
                       if process.returncode != 0:
-                          yield f"data: {json.dumps({'error': f'Download failed with code {process.returncode}'})}\n\n"
+                          yield f"data: {json.dumps({'error': f'Download failed with code {process.returncode}. (Did you accept the repo license on HuggingFace?)'})}\n\n"
                       else:
                           yield f"data: {json.dumps({'raw': '✅ Download complete!', 'percent': 100})}\n\n"
                       yield "data: [DONE]\n\n"
