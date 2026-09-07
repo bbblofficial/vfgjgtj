@@ -87,7 +87,7 @@ jobs:
 
       - name: 🔧 Write the web server (Glassmorphism UI)
         run: |
-          cat > ollama_server.py << 'PYEOF'
+          cat << 'PYEOF' > ollama_server.py
           import json
           import os
           import logging
@@ -170,7 +170,7 @@ jobs:
                       "ram_total": f"{psutil.virtual_memory().total / (1024**3):.1f} GB",
                       "os": platform.system() + " " + platform.release()
                   }
-              except Exception as e:
+              except Exception:
                   return {"cpu_threads": 4, "ram_total": "16.0 GB", "os": "Linux"}
 
           @app.get("/api/stats")
@@ -183,7 +183,7 @@ jobs:
                       "ram_used": f"{psutil.virtual_memory().used / (1024**3):.1f} GB",
                       "disk_free": f"{disk.free / (1024**3):.1f} GB free"
                   }
-              except Exception as e:
+              except Exception:
                   return {"cpu_percent": 0.0, "ram_percent": 0.0, "ram_used": "0 GB", "disk_free": "100 GB free"}
 
           @app.get("/api/models")
@@ -300,7 +300,7 @@ jobs:
                   yield "data: [DONE]\n\n"
               return StreamingResponse(generate(), media_type="text/event-stream")
 
-          HTML_TEMPLATE = """<!DOCTYPE html>
+          HTML_TEMPLATE = r"""<!DOCTYPE html>
           <html lang="en">
           <head>
           <meta charset="UTF-8">
@@ -784,11 +784,11 @@ jobs:
                   cleanupMediaListener();
                   
                   if (mediaRow) {
-                    mediaRow.innerHTML = '
+                    mediaRow.innerHTML = `
                       <div class="media-chip">
-                        <img src="' + e.target.result + '" alt="Attached image preview">
+                        <img src="${e.target.result}" alt="Attached image preview">
                         <button class="rm" id="removeMediaBtn" aria-label="Remove attached image">✕</button>
-                      </div>';
+                      </div>`;
                     
                     removeMediaHandler = removeMedia;
                     const removeBtn = $('removeMediaBtn');
@@ -900,18 +900,18 @@ jobs:
                 var active = m.name === currentModel;
                 var escapedName = escapeHtml(m.name);
                 var dlHtml = !m.downloaded ? '<button class="dl-btn" data-pull="' + escapedName + '">Pull</button>' : '';
-                return '
-                  <div class="model-row' + (active ? ' active' : '') + '" data-model="' + escapedName + '" data-downloaded="' + (m.downloaded ? '1' : '0') + '" data-clickable="' + (m.downloaded ? '1' : '0') + '">
+                return `
+                  <div class="model-row ${active ? ' active' : ''}" data-model="${escapedName}" data-downloaded="${m.downloaded ? '1' : '0'}" data-clickable="${m.downloaded ? '1' : '0'}">
                     <span class="model-dot"></span>
                     <div class="model-meta">
-                      <span class="model-name">' + escapedName + '</span>
+                      <span class="model-name">${escapedName}</span>
                       <div class="model-flags">
-                        <span class="model-chip ' + m.type + '">' + m.type + '</span>
-                        <span class="model-chip">' + (m.downloaded ? 'ready' : 'not pulled') + '</span>
+                        <span class="model-chip ${m.type}">${m.type}</span>
+                        <span class="model-chip">${m.downloaded ? 'ready' : 'not pulled'}</span>
                       </div>
                     </div>
-                    ' + dlHtml + '
-                  </div>';
+                    ${dlHtml}
+                  </div>`;
               }).join('');
             }
             
@@ -958,11 +958,11 @@ jobs:
             
             function renderEmptyLog() {
               if (!logInner || messageHistory.length) return;
-              logInner.innerHTML = '
+              logInner.innerHTML = `
                 <div class="empty-state">
                   <h2>No model loaded yet</h2>
                   <p>Pick a model in the panel and hit "Pull" to download it, then select it to start a session.</p>
-                </div>';
+                </div>`;
             }
             
             function appendTerminalLog(msg, type) {
@@ -1245,6 +1245,10 @@ jobs:
           </script>
           </body>
           </html>
+          """
+
+          if __name__ == "__main__":
+              uvicorn.run(app, host="0.0.0.0", port=PORT)
           PYEOF
           echo "✅ Server script written successfully"
 
