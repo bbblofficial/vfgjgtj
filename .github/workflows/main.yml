@@ -402,7 +402,8 @@ jobs:
           async def chat(request: ChatRequest):
               if request.model in EXTERNAL_MODEL_MAP:
                   async def error_gen():
-                      yield f"data: {json.dumps({'error': f'Model "{request.model}" is an image generator, not a chat LLM.'})}\n\n"
+                      # Fixed syntax error: escaped double quotes and concatenation
+                      yield f"data: {json.dumps({'error': 'Model \"' + request.model + '\" is an image generator, not a chat LLM.'})}\n\n"
                       yield "data: [DONE]\n\n"
                   return StreamingResponse(error_gen(), media_type="text/event-stream")
               
