@@ -7,6 +7,8 @@ jobs:
   run-ai-server:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    env:
+      PYTHONUNBUFFERED: "1" # جلوگیری از گیر کردن و بافر شدن لاگ‌های پایتون
 
     steps:
       - name: Set up Python
@@ -792,7 +794,10 @@ jobs:
           import re
           import sys
           import urllib.request
-          import shutil
+          import functools
+
+          # Force instantaneous output mapping for GitHub Actions
+          print = functools.partial(print, flush=True)
 
           KEEP_ALIVE_HOURS = 6
           KEEP_ALIVE_SECONDS = KEEP_ALIVE_HOURS * 3600
@@ -801,40 +806,26 @@ jobs:
           SERVER_BOOT_TIMEOUT = 60
           TUNNEL_URL_TIMEOUT = 45
 
-          def print_disk(label):
-              total, used, free = shutil.disk_usage("/")
-              print(f"    Disk {label}: {free / 1e9:.1f} GB free / {total / 1e9:.1f} GB total")
-
-          print("Step 0: Fast cleanup (skipping slow apt-autoremove)...")
-          print_disk("before cleanup")
+          print("⚡ Step 0: Fast cleanup (skipping slow apt-autoremove)...")
           os.system("pkill -9 -f 'server.py' || true")
           os.system("pkill -9 -f 'cloudflared' || true")
           os.system("pkill -9 -f 'ollama' || true")
           os.system("sudo fuser -k 11434/tcp 2>/dev/null || true")
           os.system("sudo fuser -k 7860/tcp 2>/dev/null || true")
           os.system("rm -f ollama.log server.log cloudflared.log cloudflared || true")
-          time.sleep(2)
+          time.sleep(1)
 
-          print("Step 1: Checking System Dependencies...")
-          def run_and_show(cmd, label, timeout=240):
-              print(f"    -> {label} ...")
-              try:
-                  r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
-                  out = (r.stdout or "") + (r.stderr or "")
-                  if out.strip():
-                      print("\n".join("     " + line for line in out.strip().splitlines()))
-                  print(f"    ({label} exit code: {r.returncode})")
-                  return r.returncode == 0, out
-              except subprocess.TimeoutExpired:
-                  print(f"    ({label} timed out after {timeout}s)")
-                  return False, "timeout"
+          print("🚀 Step 1: Checking System Dependencies...")
 
           # Fast check for zstd without running slow apt update
           r_zstd = subprocess.run("which zstd", shell=True, capture_output=True, text=True)
           if not r_zstd.stdout.strip():
-              run_and_show("sudo apt-get install -y -qq --no-install-recommends zstd procps", "Installing zstd")
+              print("    -> Installing zstd...")
+              subprocess.run("sudo apt-get install -y -qq --no-install-recommends zstd procps", shell=True)
 
-          install_ok, _ = run_and_show("curl -fsSL https://ollama.com/install.sh | sh", "Running Ollama installer", timeout=300)
+          print("    -> Installing Ollama daemon (Progress below)...")
+          # Run without capturing output so the progress bar renders live
+          subprocess.run("curl -fsSL https://ollama.com/install.sh | sh", shell=True)
 
           def find_ollama_binary():
               r = subprocess.run("which ollama", shell=True, capture_output=True, text=True)
@@ -843,11 +834,11 @@ jobs:
 
           ollama_bin = find_ollama_binary()
           if not ollama_bin:
-              print("ERROR: Could not install the 'ollama' binary.")
+              print("❌ ERROR: Could not install the 'ollama' binary.")
               sys.exit(1)
 
           ver = subprocess.run(f"{ollama_bin} --version", shell=True, capture_output=True, text=True)
-          print(f"Found ollama binary at {ollama_bin} -- {ver.stdout.strip() or ver.stderr.strip()}")
+          print(f"✅ Found ollama binary at {ollama_bin} -- {ver.stdout.strip() or ver.stderr.strip()}")
 
           os.environ["OLLAMA_NUM_PARALLEL"] = "2"
           os.environ["OLLAMA_MAX_LOADED_MODELS"] = "1"
@@ -860,10 +851,10 @@ jobs:
               except Exception:
                   return False
 
-          print("Step 2: Starting Ollama Engine...")
+          print("🧠 Step 2: Starting Ollama Engine...")
           ollama_process = None
           if is_port_listening("127.0.0.1", 11434):
-              print("Reusing existing service on 11434.")
+              print("ℹ️ Reusing existing service on 11434.")
           else:
               ollama_log = open("ollama.log", "w", encoding="utf-8")
               ollama_process = subprocess.Popen(f"{ollama_bin} serve", shell=True, stdout=ollama_log, stderr=subprocess.STDOUT)
@@ -877,28 +868,28 @@ jobs:
                   except Exception:
                       pass
                   time.sleep(2)
-              print(f"Timed out waiting for {label} at {url}")
+              print(f"❌ Timed out waiting for {label} at {url}")
               return False
 
-          print("Waiting for Ollama engine to respond...")
+          print("⏳ Waiting for Ollama engine to respond...")
           if not wait_for_http("http://127.0.0.1:11434/api/tags", OLLAMA_BOOT_TIMEOUT, "Ollama", log_path="ollama.log"):
               sys.exit(1)
-          print("Ollama engine is up.")
+          print("✅ Ollama engine is up.")
 
-          print("Step 3: Starting Web Server in Background...")
+          print("💻 Step 3: Starting Multimodal Web Server in Background...")
           server_log = open("server.log", "w", encoding="utf-8")
           server_process = subprocess.Popen([sys.executable, "server.py"], stdout=server_log, stderr=subprocess.STDOUT)
 
-          print("Waiting for server to boot... (Checking Health)")
+          print("⏳ Waiting for server to boot...")
           if not wait_for_http("http://127.0.0.1:7860/api/health", SERVER_BOOT_TIMEOUT, "OryvexAi web server", log_path="server.log"):
               if os.path.exists("server.log"):
                   with open("server.log", "r") as f:
-                      print("SERVER LOG CONTENTS:")
+                      print("❌ SERVER LOG CONTENTS:")
                       print(f.read())
               sys.exit(1)
 
-          print("Server is successfully running on port 7860.")
-          print("Step 4: Creating Cloudflare Tunnel...")
+          print("✅ Server is successfully running on port 7860.")
+          print("🔗 Step 4: Creating Cloudflare Tunnel...")
 
           if not os.path.exists("cloudflared"):
               os.system("wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared")
@@ -925,7 +916,7 @@ jobs:
           tunnel_proc = start_tunnel()
 
           print("\n" + "=" * 60)
-          print("ORYVEX AI IS UP")
+          print("🎉 ORYVEX AI IS ONLINE! 🎉")
           print("=" * 60)
 
           tunnel_url = wait_for_tunnel_url()
@@ -934,7 +925,7 @@ jobs:
           else:
               print("\n⚠️ Could not detect a tunnel URL yet -- check cloudflared.log for details.\n")
 
-          print(f"Keep-alive engaged for {KEEP_ALIVE_HOURS} hours. DO NOT STOP THIS PROCESS.")
+          print(f"⚠️ Keep-alive engaged for {KEEP_ALIVE_HOURS} hours. DO NOT STOP THIS PROCESS.")
           print("=" * 60)
 
           start_time = time.time()
@@ -946,35 +937,37 @@ jobs:
                   elapsed_h = (now - start_time) / 3600
 
                   if server_process.poll() is not None:
-                      print("Server process died -- restarting...")
+                      print("⚠️ Server process died -- restarting...")
                       server_log = open("server.log", "a", encoding="utf-8")
                       server_process = subprocess.Popen([sys.executable, "server.py"], stdout=server_log, stderr=subprocess.STDOUT)
                       wait_for_http("http://127.0.0.1:7860/api/health", SERVER_BOOT_TIMEOUT, "OryvexAi web server")
 
                   if ollama_process is not None and ollama_process.poll() is not None:
-                      print("Ollama process died -- restarting...")
+                      print("⚠️ Ollama process died -- restarting...")
                       ollama_log = open("ollama.log", "a", encoding="utf-8")
                       ollama_process = subprocess.Popen(f"{ollama_bin} serve", shell=True, stdout=ollama_log, stderr=subprocess.STDOUT)
                       wait_for_http("http://127.0.0.1:11434/api/tags", OLLAMA_BOOT_TIMEOUT, "Ollama", log_path="ollama.log")
 
                   if tunnel_proc.poll() is not None:
-                      print("Tunnel process died -- restarting...")
+                      print("⚠️ Tunnel process died -- restarting...")
                       tunnel_proc = start_tunnel()
                       new_url = wait_for_tunnel_url()
                       if new_url:
                           tunnel_url = new_url
-                          print(f"NEW TUNNEL URL: {tunnel_url}")
+                          print(f"👉 NEW TUNNEL URL: {tunnel_url}")
 
                   if now - last_heartbeat >= HEARTBEAT_INTERVAL:
                       last_heartbeat = now
                       remaining_h = (KEEP_ALIVE_SECONDS - (now - start_time)) / 3600
-                      print(f"Alive -- {elapsed_h:.2f}h elapsed, {remaining_h:.2f}h remaining. URL: {tunnel_url}")
+                      print(f"💓 Heartbeat -- {elapsed_h:.2f}h elapsed, {remaining_h:.2f}h remaining. Live at: {tunnel_url}")
 
                   time.sleep(5)
 
           except KeyboardInterrupt:
-              print("\nKeep-alive interrupted manually.")
+              print("\n🛑 Keep-alive interrupted manually.")
           PYEOF
 
-      - name: Start the Server
-        run: python main.py
+      - name: Start the Server (Unbuffered Output)
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: python -u main.py
